@@ -1,0 +1,696 @@
+from typing import Any, Dict, Optional, Tuple
+
+import torch
+import torch.nn as nn
+from torch.distributions import Categorical
+
+from lvar.utils import (
+    ACTION_GLOBAL,
+    ACTION_NAMES,
+    ACTION_PATCH,
+    ACTION_REGION,
+    ACTION_STOP,
+    ACTION_THINK,
+    extract_tagged_answer,
+)
+
+try:
+    from transformers import AutoProcessor, Qwen2VLForConditionalGeneration
+except ImportError:  # pragma: no cover - exercised in environments without HF deps
+    AutoProcessor = None
+    Qwen2VLForConditionalGeneration = None
+
+
+class ControllerHead(nn.Module):
+    """Small policy head that scores action type and visual-unit indices."""
+
+    def __init__(self, hidden_size: int, num_actions: int) -> None:
+        """
+        Args:
+            hidden_size: Backbone hidden width used by latent/act states.
+            num_actions: Number of high-level controller actions.
+
+        Attributes:
+            fuse: MLP combining latent, act, and step embeddings.
+            type_head: Produces logits for THINK/STOP/GLOBAL/REGION/PATCH.
+            region_query: Projects controller state into region-selection query.
+            patch_query: Projects controller state into patch-selection query.
+        """
+        super().__init__()
+        self.fuse = nn.Sequential(
+            nn.Linear(hidden_size * 3, hidden_size),
+            nn.Tanh(),
+            nn.Linear(hidden_size, hidden_size),
+            nn.Tanh(),
+        )
+        self.type_head = nn.Linear(hidden_size, num_actions)
+        self.region_query = nn.Linear(hidden_size, hidden_size)
+        self.patch_query = nn.Linear(hidden_size, hidden_size)
+
+    def forward(
+        self,
+        latent_hidden: torch.Tensor,
+        act_hidden: torch.Tensor,
+        step_hidden: torch.Tensor,
+        bank: Dict[str, torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return action-type logits and index logits for regions and patches."""
+        # Fuse controller context from current reasoning state and recurrent step id.
+        controller_hidden = self.fuse(torch.cat([latent_hidden, act_hidden, step_hidden], dim=-1))
+        type_logits = self.type_head(controller_hidden)
+
+        # Broadcast bank vectors so each batch item gets the same visual candidate set.
+        batch_size = controller_hidden.size(0)
+        region_bank = bank["regions"].unsqueeze(0).expand(batch_size, -1, -1)
+        patch_bank = bank["patches"].unsqueeze(0).expand(batch_size, -1, -1)
+
+        # Score visual candidates with simple query-dot-bank products.
+        region_query = self.region_query(controller_hidden).unsqueeze(-1)
+        patch_query = self.patch_query(controller_hidden).unsqueeze(-1)
+
+        region_logits = torch.bmm(region_bank, region_query).squeeze(-1)
+        patch_logits = torch.bmm(patch_bank, patch_query).squeeze(-1)
+        return type_logits, region_logits, patch_logits
+
+
+class QwenLVAR(nn.Module):
+    """Minimal LVAR wrapper around Qwen2-VL with recurrent controller actions."""
+
+    def __init__(
+        self,
+        cfg: Dict[str, Any],
+        backbone: Optional[nn.Module] = None,
+        processor: Optional[Any] = None,
+    ) -> None:
+        """
+        Initialize frozen Qwen2-VL plus trainable LVAR-specific parameters.
+
+        Attributes:
+            cfg/model_id/device/dtype: Runtime config values.
+            max_steps: Hard upper bound on recurrent reasoning iterations.
+            region_window: Non-overlapping region pooling window over patch grid.
+            max_answer_tokens: Greedy decode length cap.
+            action_selection: Stored config knob; runtime path uses sample flag.
+            backbone: Frozen Qwen2-VL (or injected stub backbone in tests).
+            processor: HF processor used to build multimodal prompts.
+            hidden_size: LM hidden width shared by added parameters.
+            image_token_id/eos_token_id: Backbone token ids used in embedding/decode logic.
+            latent_token/act_token: Learned recurrent control tokens.
+            global_pool/region_pool: Attention scorers for visual-bank pooling.
+            controller: Policy head over action type + region/patch indices.
+            evidence_projection: Projects selected visual evidence into LM hidden space.
+            step_embedding: Embedding table for recurrent step index.
+            _current_image_grid: Cached (H, W) grid read from processor outputs.
+        """
+        super().__init__()
+        # Basic runtime config.
+        self.cfg = cfg
+        self.model_id = cfg.get("model_id", "Qwen/Qwen2-VL-2B-Instruct")
+        self.device = self._resolve_device(cfg.get("device", "auto"))
+        self.dtype = self._resolve_dtype(cfg.get("dtype", "auto"))
+        self.max_steps = int(cfg.get("max_steps", 4))
+        self.region_window = cfg.get("region_window", 2)
+        self.max_answer_tokens = int(cfg.get("max_answer_tokens", 16))
+        self.action_selection = cfg.get("action_selection", "argmax")
+
+        # Load real HF components unless tests inject a stub backbone/processor pair.
+        if backbone is None:
+            if Qwen2VLForConditionalGeneration is None or AutoProcessor is None:
+                raise ImportError(
+                    "transformers is required to instantiate the real Qwen2-VL backbone. "
+                    "Install the requirements first."
+                )
+            backbone_kwargs: Dict[str, Any] = {}
+            if self.device.type == "cuda":
+                backbone_kwargs["torch_dtype"] = self.dtype
+            self.backbone = Qwen2VLForConditionalGeneration.from_pretrained(
+                self.model_id,
+                **backbone_kwargs,
+            )
+            self.processor = AutoProcessor.from_pretrained(self.model_id)
+        else:
+            self.backbone = backbone
+            self.processor = processor
+            if self.processor is None:
+                raise ValueError("A processor must be provided when injecting a custom backbone.")
+
+        # Read backbone metadata needed by custom multimodal and decode paths.
+        if hasattr(self.backbone, "to"):
+            self.backbone.to(self.device)
+        self.hidden_size = getattr(
+            self.backbone.config,
+            "hidden_size",
+            self.backbone.get_input_embeddings().embedding_dim,
+        )
+        self.image_token_id = getattr(self.backbone.config, "image_token_id", None)
+        self.eos_token_id = getattr(self.backbone.config, "eos_token_id", None)
+        tokenizer = getattr(self.processor, "tokenizer", None)
+        if self.eos_token_id is None and tokenizer is not None:
+            self.eos_token_id = getattr(tokenizer, "eos_token_id", None)
+
+        # Trainable LVAR additions.
+        self.latent_token = nn.Parameter(torch.randn(self.hidden_size) * 0.02)
+        self.act_token = nn.Parameter(torch.randn(self.hidden_size) * 0.02)
+        self.global_pool = nn.Linear(self.hidden_size, 1)
+        self.region_pool = nn.Linear(self.hidden_size, 1)
+        self.controller = ControllerHead(self.hidden_size, len(ACTION_NAMES))
+        self.evidence_projection = nn.Linear(self.hidden_size, self.hidden_size)
+        self.step_embedding = nn.Embedding(self.max_steps, self.hidden_size)
+
+        # Freeze backbone to keep training focused on controller-driven reasoning behavior.
+        for parameter in self.backbone.parameters():
+            parameter.requires_grad = False
+        self.backbone.eval()
+        self._current_image_grid: Optional[Tuple[int, int]] = None
+        self.to(self.device)
+
+    def train(self, mode: bool = True) -> "QwenLVAR":
+        """
+        Keep backbone in eval mode even during training.
+
+        We still allow gradients through custom parameters, but backbone weights
+        remain frozen and should not switch to dropout/training behavior.
+        """
+        super().train(mode)
+        self.backbone.eval()
+        return self
+
+    def _resolve_device(self, device_name: str) -> torch.device:
+        """Resolve user config to an actual torch.device."""
+        if device_name == "auto":
+            return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        return torch.device(device_name)
+
+    def _resolve_dtype(self, dtype_name: str) -> torch.dtype:
+        """Map string dtype aliases from config into torch dtypes."""
+        mapping = {
+            "float32": torch.float32,
+            "fp32": torch.float32,
+            "float16": torch.float16,
+            "fp16": torch.float16,
+            "bfloat16": torch.bfloat16,
+            "bf16": torch.bfloat16,
+        }
+        return mapping.get(str(dtype_name).lower(), torch.float32)
+
+    def _move_batch_to_device(self, batch: Dict[str, Any]) -> Dict[str, Any]:
+        """Move tensor fields to model device while keeping metadata untouched."""
+        moved: Dict[str, Any] = {}
+        for key, value in batch.items():
+            if isinstance(value, torch.Tensor):
+                moved[key] = value.to(self.device)
+            else:
+                moved[key] = value
+        return moved
+
+    def _embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """Look up token embeddings with model-compatible dtype/device."""
+        embeddings = self.backbone.get_input_embeddings()(input_ids.to(self.device))
+        return embeddings.to(dtype=self.latent_token.dtype)
+
+    def _attention_pool(self, tokens: torch.Tensor, scorer: nn.Linear) -> torch.Tensor:
+        """Single-query attention pooling used for global/region visual summaries."""
+        weights = torch.softmax(scorer(tokens).squeeze(-1), dim=0)
+        return torch.sum(weights.unsqueeze(-1) * tokens, dim=0)
+
+    def _infer_image_grid(self, image_tokens: torch.Tensor) -> Tuple[int, int]:
+        """Infer or reuse patch grid dimensions required for region-window pooling."""
+        if self._current_image_grid is not None:
+            return self._current_image_grid
+        num_patches = image_tokens.size(0)
+        side = int(num_patches ** 0.5)
+        if side * side != num_patches:
+            raise ValueError("Unable to infer a square patch grid for the visual bank.")
+        return side, side
+
+    def _build_multimodal_embeddings(self, batch: Dict[str, Any]) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Build embedding-space prefix where image placeholder tokens are replaced
+        by projected image vectors from the vision encoder.
+        """
+        input_ids = batch["input_ids"]
+        attention_mask = batch["attention_mask"]
+        embeddings = self._embed_input_ids(input_ids)
+        image_tokens = batch.get("projected_image_tokens")
+        if image_tokens is not None:
+            if self.image_token_id is None:
+                raise ValueError("The backbone config does not expose image_token_id.")
+            image_tokens = image_tokens.squeeze(0) if image_tokens.dim() == 3 else image_tokens
+            image_mask = input_ids == self.image_token_id
+            num_image_slots = int(image_mask.sum().item())
+            if num_image_slots != image_tokens.size(0):
+                raise ValueError(
+                    f"Expected {num_image_slots} projected image tokens but received {image_tokens.size(0)}."
+                )
+            # Clone before in-place replacement so callers that reuse embeddings stay safe.
+            embeddings = embeddings.clone()
+            embeddings[image_mask] = image_tokens.to(embeddings.dtype)
+        return embeddings, attention_mask.to(self.device)
+
+    def _decode_ids(self, generated_ids: torch.Tensor) -> str:
+        """Decode token ids using processor or tokenizer fallback chain."""
+        token_ids = generated_ids.tolist()
+        if hasattr(self.processor, "batch_decode"):
+            return self.processor.batch_decode([token_ids], skip_special_tokens=True)[0]
+        tokenizer = getattr(self.processor, "tokenizer", None)
+        if tokenizer is not None and hasattr(tokenizer, "decode"):
+            return tokenizer.decode(token_ids, skip_special_tokens=True)
+        return " ".join(str(token_id) for token_id in token_ids)
+
+    def _select_action(self, type_logits: torch.Tensor, sample_actions: bool) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Select hard action ids and return the chosen-action log-prob."""
+        distribution = Categorical(logits=type_logits)
+        if sample_actions:
+            action_tensor = distribution.sample()
+        else:
+            action_tensor = torch.argmax(type_logits, dim=-1)
+        return action_tensor, distribution.log_prob(action_tensor)
+
+    def _select_index(self, index_logits: torch.Tensor, sample_actions: bool) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Select a region/patch index from logits and return its log-prob."""
+        distribution = Categorical(logits=index_logits)
+        if sample_actions:
+            index_tensor = distribution.sample()
+        else:
+            index_tensor = torch.argmax(index_logits, dim=-1)
+        return index_tensor, distribution.log_prob(index_tensor)
+
+    def _write_recurrent_tokens(
+        self,
+        inputs_embeds: torch.Tensor,
+        latent_pos: int,
+        act_pos: int,
+        latent_hidden: torch.Tensor,
+        act_hidden: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Perform the pure recurrent THINK update.
+
+        The next-step input embedding for each control token is set directly to
+        that token's current output hidden state. There is no extra projection:
+        THINK is just one more recurrent pass of the same hidden state.
+        """
+        updated_embeds = inputs_embeds.clone()
+        updated_embeds[:, latent_pos, :] = latent_hidden.to(updated_embeds.dtype)
+        updated_embeds[:, act_pos, :] = act_hidden.to(updated_embeds.dtype)
+        return updated_embeds
+
+    def prepare_inputs(self, images: Any, questions: Any) -> Dict[str, Any]:
+        """
+        Build one multimodal prompt for image + question and tokenize via processor.
+
+        The prompt always instructs the model to emit a tagged final answer so
+        parsing and reward computation stay stable.
+        """
+        image = images[0] if isinstance(images, (list, tuple)) else images
+        question = questions[0] if isinstance(questions, (list, tuple)) else questions
+        prompt = (
+            f"{question}\n"
+            "Return only the final answer inside <answer>...</answer>."
+        )
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": image},
+                    {"type": "text", "text": prompt},
+                ],
+            }
+        ]
+        if not hasattr(self.processor, "apply_chat_template"):
+            raise ValueError("The processor must implement apply_chat_template for this prototype.")
+        batch = self.processor.apply_chat_template(
+            messages,
+            add_generation_prompt=True,
+            tokenize=True,
+            return_dict=True,
+            return_tensors="pt",
+        )
+        batch = self._move_batch_to_device(dict(batch))
+        batch["messages"] = messages
+        batch["question"] = question
+        return batch
+
+    def get_projected_image_tokens(self, batch: Dict[str, Any]) -> torch.Tensor:
+        """
+        Extract LM-space projected image tokens from Qwen2-VL visual encoder.
+
+        This is the single method where model-internal visual calls are allowed,
+        because HF public APIs do not directly expose this projected token bank.
+        """
+        if "projected_image_tokens" in batch:
+            return batch["projected_image_tokens"]
+        pixel_values = batch.get("pixel_values")
+        image_grid_thw = batch.get("image_grid_thw")
+        if pixel_values is None:
+            raise ValueError("pixel_values are required to extract projected image tokens.")
+        if image_grid_thw is not None:
+            if image_grid_thw.dim() == 2:
+                grid_h = int(image_grid_thw[0, -2].item())
+                grid_w = int(image_grid_thw[0, -1].item())
+            else:
+                grid_h = int(image_grid_thw[-2].item())
+                grid_w = int(image_grid_thw[-1].item())
+            self._current_image_grid = (grid_h, grid_w)
+        if not hasattr(self.backbone, "visual"):
+            raise ValueError("The backbone does not expose a visual encoder for projected image tokens.")
+        # Support minor signature differences across backbone/test doubles.
+        try:
+            image_tokens = self.backbone.visual(pixel_values, grid_thw=image_grid_thw)
+        except TypeError:
+            try:
+                image_tokens = self.backbone.visual(pixel_values, image_grid_thw)
+            except TypeError:
+                image_tokens = self.backbone.visual(pixel_values)
+        if image_tokens.dim() == 3:
+            image_tokens = image_tokens[0]
+        return image_tokens.to(self.device, dtype=self.latent_token.dtype)
+
+    def build_visual_bank(self, image_tokens: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """
+        Construct:
+            patches: raw projected image tokens
+            regions: attention-pooled non-overlapping windows over patch grid
+            global: attention-pooled summary over all patches
+        """
+        patch_tokens = image_tokens.squeeze(0) if image_tokens.dim() == 3 else image_tokens
+        grid_h, grid_w = self._infer_image_grid(patch_tokens)
+        if grid_h * grid_w != patch_tokens.size(0):
+            raise ValueError("Projected image tokens do not match the expected patch grid.")
+        region_window = self.region_window
+        if isinstance(region_window, int):
+            region_window = (region_window, region_window)
+        region_h, region_w = region_window
+        if grid_h % region_h != 0 or grid_w % region_w != 0:
+            raise ValueError(
+                f"Region window {region_window} does not evenly tile the patch grid {(grid_h, grid_w)}."
+            )
+        # Convert flat patch list into grid for non-overlapping region windows.
+        patch_grid = patch_tokens.view(grid_h, grid_w, self.hidden_size)
+        global_token = self._attention_pool(patch_tokens, self.global_pool).unsqueeze(0)
+
+        # Pool each region window into one coarse vector.
+        region_tokens = []
+        for row in range(0, grid_h, region_h):
+            for col in range(0, grid_w, region_w):
+                window = patch_grid[row : row + region_h, col : col + region_w, :].reshape(-1, self.hidden_size)
+                region_tokens.append(self._attention_pool(window, self.region_pool))
+        regions = torch.stack(region_tokens, dim=0)
+
+        return {
+            "global": global_token,
+            "regions": regions,
+            "patches": patch_tokens,
+        }
+
+    def build_initial_state(self, batch: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Create recurrent state dict with multimodal prefix plus latent/act tokens.
+
+        The state object is intentionally simple and mutable so each reasoning
+        step can update it in-place.
+        """
+        inputs_embeds, attention_mask = self._build_multimodal_embeddings(batch)
+        latent = self.latent_token.view(1, 1, -1).to(inputs_embeds.dtype)
+        act = self.act_token.view(1, 1, -1).to(inputs_embeds.dtype)
+        inputs_embeds = torch.cat([inputs_embeds, latent, act], dim=1)
+        attention_mask = torch.cat(
+            [attention_mask, torch.ones((1, 2), device=self.device, dtype=attention_mask.dtype)],
+            dim=1,
+        )
+        latent_pos = inputs_embeds.size(1) - 2
+        act_pos = inputs_embeds.size(1) - 1
+        return {
+            "inputs_embeds": inputs_embeds,
+            "attention_mask": attention_mask,
+            "latent_pos": latent_pos,
+            "act_pos": act_pos,
+            "trace": [],
+            "action_log_probs": [],
+            "question": batch.get("question"),
+            "sample_actions": False,
+        }
+
+    def forward_reasoning_step(
+        self,
+        state: Dict[str, Any],
+        bank: Dict[str, torch.Tensor],
+        step_idx: int,
+    ) -> Tuple[Dict[str, Any], int, bool, Dict[str, Any]]:
+        """
+        Run one LVAR controller step:
+        1) backbone pass, 2) controller action, 3) optional evidence insertion.
+        """
+        # Run current sequence through the LM and read the latest hidden states.
+        outputs = self.backbone(
+            inputs_embeds=state["inputs_embeds"],
+            attention_mask=state["attention_mask"],
+            output_hidden_states=True,
+            return_dict=True,
+            use_cache=False,
+        )
+        hidden_states = getattr(outputs, "hidden_states", None)
+        if hidden_states is None:
+            hidden_states = [getattr(outputs, "last_hidden_state")]
+        final_hidden = hidden_states[-1]
+        latent_hidden = final_hidden[:, state["latent_pos"], :]
+        act_hidden = final_hidden[:, state["act_pos"], :]
+        # Step embedding gives the controller explicit notion of iteration depth.
+        step_hidden = self.step_embedding(
+            torch.tensor([step_idx], device=self.device, dtype=torch.long)
+        )
+        type_logits, region_logits, patch_logits = self.controller(latent_hidden, act_hidden, step_hidden, bank)
+        action_tensor, action_log_prob = self._select_action(type_logits, state.get("sample_actions", False))
+        action_id = int(action_tensor.item())
+        action_name = ACTION_NAMES[action_id]
+        should_stop = action_id == ACTION_STOP
+
+        # Map action to evidence token selection. THINK and STOP add no evidence.
+        region_index = None
+        patch_index = None
+        evidence_token = None
+        if action_id == ACTION_GLOBAL:
+            evidence_token = bank["global"][0]
+        elif action_id == ACTION_REGION:
+            region_tensor, region_log_prob = self._select_index(region_logits, state.get("sample_actions", False))
+            region_index = int(region_tensor.item())
+            action_log_prob = action_log_prob + region_log_prob
+            evidence_token = bank["regions"][region_index]
+        elif action_id == ACTION_PATCH:
+            patch_tensor, patch_log_prob = self._select_index(patch_logits, state.get("sample_actions", False))
+            patch_index = int(patch_tensor.item())
+            action_log_prob = action_log_prob + patch_log_prob
+            evidence_token = bank["patches"][patch_index]
+
+        sequence_length_before = state["inputs_embeds"].size(1)
+        # THINK is the only action that performs a pure recurrent hidden-state update.
+        if action_id == ACTION_THINK:
+            state["inputs_embeds"] = self._write_recurrent_tokens(
+                state["inputs_embeds"],
+                state["latent_pos"],
+                state["act_pos"],
+                latent_hidden,
+                act_hidden,
+            )
+
+        # Then insert chosen evidence right before latent token, shifting tracked positions.
+        if evidence_token is not None:
+            projected = self.evidence_projection(evidence_token).view(1, 1, -1).to(state["inputs_embeds"].dtype)
+            prefix = state["inputs_embeds"][:, : state["latent_pos"], :]
+            suffix = state["inputs_embeds"][:, state["latent_pos"] :, :]
+            state["inputs_embeds"] = torch.cat([prefix, projected, suffix], dim=1)
+
+            prefix_mask = state["attention_mask"][:, : state["latent_pos"]]
+            suffix_mask = state["attention_mask"][:, state["latent_pos"] :]
+            new_mask = torch.ones((1, 1), device=self.device, dtype=state["attention_mask"].dtype)
+            state["attention_mask"] = torch.cat([prefix_mask, new_mask, suffix_mask], dim=1)
+
+            state["latent_pos"] += 1
+            state["act_pos"] += 1
+
+        # Persist step-level metadata for debug and policy-gradient training.
+        step_trace = {
+            "step_idx": step_idx,
+            "action_id": action_id,
+            "action": action_name,
+            "should_stop": should_stop,
+            "region_index": region_index,
+            "patch_index": patch_index,
+            "sequence_length_before": sequence_length_before,
+            "sequence_length_after": state["inputs_embeds"].size(1),
+            "action_log_prob": float(action_log_prob.detach().item()),
+        }
+        state["trace"].append(step_trace)
+        state["action_log_probs"].append(action_log_prob)
+        return state, action_id, should_stop, step_trace
+
+    def drop_act_token(self, state: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Remove act token only for final decoding.
+
+        Important: this uses tensor slicing + concat on existing tensors, so
+        autograd stays connected to all prior recurrent computations.
+        """
+        act_pos = state["act_pos"]
+        if act_pos is None:
+            return state
+        # Keep the graph connected by slicing the existing tensor and concatenating
+        # the surviving pieces. We intentionally do not detach or rebuild from scratch.
+        before = state["inputs_embeds"][:, :act_pos, :]
+        after = state["inputs_embeds"][:, act_pos + 1 :, :]
+        state["inputs_embeds"] = torch.cat([before, after], dim=1)
+        state["attention_mask"] = torch.cat(
+            [state["attention_mask"][:, :act_pos], state["attention_mask"][:, act_pos + 1 :]],
+            dim=1,
+        )
+        state["act_pos"] = None
+        return state
+
+    def decode_answer(self, state: Dict[str, Any], labels: Optional[Any] = None) -> Dict[str, Any]:
+        """
+        Greedy autoregressive decoding from a custom embedding prefix.
+
+        We avoid model.generate() here because the prefix has custom token-level
+        surgery (latent/evidence tokens and act-token removal) that we need to
+        control explicitly.
+        """
+        del labels
+        decode_prefix_length = state["inputs_embeds"].size(1)
+        current_embeds = state["inputs_embeds"]
+        current_mask = state["attention_mask"]
+        generated_ids = []
+
+        # Decode token-by-token with argmax to keep inference deterministic.
+        for _ in range(self.max_answer_tokens):
+            outputs = self.backbone(
+                inputs_embeds=current_embeds,
+                attention_mask=current_mask,
+                output_hidden_states=False,
+                return_dict=True,
+                use_cache=False,
+            )
+            next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1)
+            token_id = int(next_token.item())
+            if self.eos_token_id is not None and token_id == self.eos_token_id:
+                break
+            generated_ids.append(token_id)
+            # Feed generated token back into the running prefix.
+            next_embed = self._embed_input_ids(next_token.unsqueeze(1))
+            current_embeds = torch.cat([current_embeds, next_embed], dim=1)
+            current_mask = torch.cat(
+                [
+                    current_mask,
+                    torch.ones((1, 1), device=self.device, dtype=current_mask.dtype),
+                ],
+                dim=1,
+            )
+
+        generated_tensor = torch.tensor(generated_ids, device=self.device, dtype=torch.long)
+        generated_text = self._decode_ids(generated_tensor.cpu()) if generated_ids else ""
+        return {
+            "generated_ids": generated_ids,
+            "generated_text": generated_text,
+            "answer": extract_tagged_answer(generated_text),
+            "decode_prefix_length": decode_prefix_length,
+            "final_sequence_length": current_embeds.size(1),
+            "final_inputs_embeds": current_embeds,
+            "final_attention_mask": current_mask,
+        }
+
+    def forward(
+        self,
+        images: Any,
+        questions: Any,
+        labels: Optional[Any] = None,
+        sample_actions: Optional[bool] = None,
+    ) -> Dict[str, Any]:
+        """
+        Main LVAR path: prepare -> visual bank -> recurrent loop -> act drop -> decode.
+        """
+        # Build model-ready inputs and visual candidate bank.
+        prepared = self.prepare_inputs(images, questions)
+        image_tokens = self.get_projected_image_tokens(prepared)
+        prepared["projected_image_tokens"] = image_tokens
+        bank = self.build_visual_bank(image_tokens)
+        state = self.build_initial_state(prepared)
+        state["sample_actions"] = self.training if sample_actions is None else sample_actions
+
+        # Controller loop runs until STOP or max_steps.
+        stopped = False
+        for step_idx in range(self.max_steps):
+            state, _, stopped, _ = self.forward_reasoning_step(state, bank, step_idx)
+            if stopped:
+                break
+
+        # Final decode excludes act token but keeps latent/evidence context.
+        state = self.drop_act_token(state)
+        decoded = self.decode_answer(state, labels=labels)
+        action_log_prob_sum = None
+        if state["action_log_probs"]:
+            action_log_prob_sum = torch.stack(state["action_log_probs"]).sum()
+        return {
+            "answer": decoded["answer"],
+            "generated_text": decoded["generated_text"],
+            "generated_ids": decoded["generated_ids"],
+            "trace": state["trace"],
+            "num_steps": len(state["trace"]),
+            "stopped": stopped,
+            "decode_prefix_length": decoded["decode_prefix_length"],
+            "final_sequence_length": decoded["final_sequence_length"],
+            "action_log_probs": state["action_log_probs"],
+            "action_log_prob_sum": action_log_prob_sum,
+        }
+
+    def baseline_forward(
+        self,
+        images: Any,
+        questions: Any,
+        labels: Optional[Any] = None,
+    ) -> Dict[str, Any]:
+        """Reference no-latent path used for delta reward comparisons."""
+        prepared = self.prepare_inputs(images, questions)
+        image_tokens = self.get_projected_image_tokens(prepared)
+        prepared["projected_image_tokens"] = image_tokens
+        inputs_embeds, attention_mask = self._build_multimodal_embeddings(prepared)
+        state = {
+            "inputs_embeds": inputs_embeds,
+            "attention_mask": attention_mask,
+            "latent_pos": None,
+            "act_pos": None,
+        }
+        decoded = self.decode_answer(state, labels=labels)
+        return {
+            "answer": decoded["answer"],
+            "generated_text": decoded["generated_text"],
+            "generated_ids": decoded["generated_ids"],
+            "trace": [],
+            "num_steps": 0,
+            "decode_prefix_length": decoded["decode_prefix_length"],
+            "final_sequence_length": decoded["final_sequence_length"],
+        }
+
+    def generate_lvar(self, images: Any, questions: Any) -> Dict[str, Any]:
+        """Inference wrapper for LVAR with deterministic (argmax) controller behavior."""
+        was_training = self.training
+        self.eval()
+        with torch.no_grad():
+            output = self.forward(images, questions, sample_actions=False)
+        self.train(was_training)
+        return {
+            "prediction": output["answer"],
+            "trace": output["trace"],
+            "num_steps": output["num_steps"],
+            "generated_text": output["generated_text"],
+        }
+
+    def generate_baseline(self, images: Any, questions: Any) -> Dict[str, Any]:
+        """Inference wrapper for baseline path."""
+        was_training = self.training
+        self.eval()
+        with torch.no_grad():
+            output = self.baseline_forward(images, questions)
+        self.train(was_training)
+        return {
+            "prediction": output["answer"],
+            "generated_text": output["generated_text"],
+        }

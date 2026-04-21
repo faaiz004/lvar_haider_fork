@@ -1,0 +1,9 @@
+torch
+transformers
+datasets[vision]
+accelerate
+pillow
+pyyaml
+tqdm
+pytest
+jsonlines

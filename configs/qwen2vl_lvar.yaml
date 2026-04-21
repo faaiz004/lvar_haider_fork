@@ -1,0 +1,31 @@
+model:
+  model_id: Qwen/Qwen2-VL-2B-Instruct
+  device: auto
+  dtype: auto
+  max_steps: 4
+  region_window: 2
+  max_answer_tokens: 16
+  action_selection: argmax
+
+dataset:
+  name: MMInstruction/Clevr_CoGenT_TrainA_70K_Complex
+  split: train
+  limit:
+
+train:
+  seed: 42
+  learning_rate: 0.0001
+  weight_decay: 0.0
+  num_epochs: 1
+  group_size: 4
+  max_examples:
+  grad_clip_norm: 1.0
+  log_every: 10
+  output_dir: outputs/train
+
+inference:
+  limit:
+  output_path: outputs/clevr_predictions.jsonl
+
+debug:
+  index: 0
