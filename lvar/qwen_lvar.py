@@ -236,61 +236,75 @@ class QwenLVAR(nn.Module):
             padded_grid = torch.cat([padded_grid, padded_cols], dim=1)
         return padded_grid, grid_h + pad_h, grid_w + pad_w
 
-    def _infer_image_grid(self, image_tokens: torch.Tensor) -> Tuple[int, int]:
-        """Infer or reuse patch grid dimensions required for region-window pooling."""
-        num_patches = image_tokens.size(0)
-        # print("raw grid from metadata:", self._current_image_grid)
-        # print("num_patches:", num_patches)
-        if self._current_image_grid is not None:
-            grid_h, grid_w = self._current_image_grid
-            if grid_h * grid_w == num_patches:
-                return grid_h, grid_w
+    # def _infer_image_grid(self, image_tokens: torch.Tensor) -> Tuple[int, int]:
+    #     """Infer or reuse patch grid dimensions required for region-window pooling."""
+    #     num_patches = image_tokens.size(0)
+    #     # print("raw grid from metadata:", self._current_image_grid)
+    #     # print("num_patches:", num_patches)
+    #     if self._current_image_grid is not None:
+    #         grid_h, grid_w = self._current_image_grid
+    #         if grid_h * grid_w == num_patches:
+    #             return grid_h, grid_w
 
-            # Qwen2-VL can merge neighboring visual patches before exposing the
-            # projected tokens, so image_grid_thw may describe the pre-merge grid.
-            inferred = self._infer_merged_image_grid(grid_h, grid_w, num_patches)
-            if inferred is not None:
-                self._current_image_grid = inferred
-                return inferred
+    #         # Qwen2-VL can merge neighboring visual patches before exposing the
+    #         # projected tokens, so image_grid_thw may describe the pre-merge grid.
+    #         inferred = self._infer_merged_image_grid(grid_h, grid_w, num_patches)
+    #         if inferred is not None:
+    #             self._current_image_grid = inferred
+    #             return inferred
 
-        side = int(num_patches ** 0.5)
-        if side * side != num_patches:
-            raise ValueError("Unable to infer a square patch grid for the visual bank.")
-        return side, side
+    #     side = int(num_patches ** 0.5)
+    #     if side * side != num_patches:
+    #         raise ValueError("Unable to infer a square patch grid for the visual bank.")
+    #     return side, side
 
-    def _infer_merged_image_grid(
-        self,
-        grid_h: int,
-        grid_w: int,
-        num_patches: int,
-    ) -> Optional[Tuple[int, int]]:
-        """Resolve projected-token grids when the processor reports a pre-merge shape."""
-        original_area = grid_h * grid_w
-        if original_area % num_patches != 0:
-            return None
+    # def _infer_merged_image_grid(
+    #     self,
+    #     grid_h: int,
+    #     grid_w: int,
+    #     num_patches: int,
+    # ) -> Optional[Tuple[int, int]]:
+    #     """Resolve projected-token grids when the processor reports a pre-merge shape."""
+    #     print("Attempting to infer merged image grid...")
+    #     original_area = grid_h * grid_w
+    #     if original_area % num_patches != 0:
+    #         return None
 
-        merge_area = original_area // num_patches
-        merge_side = int(math.isqrt(merge_area))
-        if merge_side > 0 and merge_side * merge_side == merge_area:
-            if grid_h % merge_side == 0 and grid_w % merge_side == 0:
-                return grid_h // merge_side, grid_w // merge_side
+    #     merge_area = original_area // num_patches
+    #     merge_side = int(math.isqrt(merge_area))
+    #     if merge_side > 0 and merge_side * merge_side == merge_area:
+    #         if grid_h % merge_side == 0 and grid_w % merge_side == 0:
+    #             return grid_h // merge_side, grid_w // merge_side
 
-        # Fall back to the divisor pair that best preserves the original aspect ratio.
-        aspect_ratio = grid_h / max(grid_w, 1)
-        best: Optional[Tuple[float, Tuple[int, int]]] = None
-        for candidate_h in range(1, int(math.isqrt(num_patches)) + 1):
-            if num_patches % candidate_h != 0:
-                continue
-            candidate_w = num_patches // candidate_h
-            for resolved_h, resolved_w in ((candidate_h, candidate_w), (candidate_w, candidate_h)):
-                if resolved_h > grid_h or resolved_w > grid_w:
-                    continue
-                if grid_h % resolved_h != 0 or grid_w % resolved_w != 0:
-                    continue
-                score = abs((resolved_h / max(resolved_w, 1)) - aspect_ratio)
-                if best is None or score < best[0]:
-                    best = (score, (resolved_h, resolved_w))
-        return None if best is None else best[1]
+    #     # Fall back to the divisor pair that best preserves the original aspect ratio.
+    #     aspect_ratio = grid_h / max(grid_w, 1)
+    #     best: Optional[Tuple[float, Tuple[int, int]]] = None
+    #     for candidate_h in range(1, int(math.isqrt(num_patches)) + 1):
+    #         if num_patches % candidate_h != 0:
+    #             continue
+    #         candidate_w = num_patches // candidate_h
+    #         for resolved_h, resolved_w in ((candidate_h, candidate_w), (candidate_w, candidate_h)):
+    #             if resolved_h > grid_h or resolved_w > grid_w:
+    #                 continue
+    #             if grid_h % resolved_h != 0 or grid_w % resolved_w != 0:
+    #                 continue
+    #             score = abs((resolved_h / max(resolved_w, 1)) - aspect_ratio)
+    #             if best is None or score < best[0]:
+    #                 best = (score, (resolved_h, resolved_w))
+    #     return None if best is None else best[1]
+    def _resolve_image_grids(self, image_grid_thw: torch.Tensor) -> tuple[tuple[int,int], tuple[int,int]]:
+        if image_grid_thw.dim() == 2:
+            H = int(image_grid_thw[0, -2].item())
+            W = int(image_grid_thw[0, -1].item())
+        else:
+            H = int(image_grid_thw[-2].item())
+            W = int(image_grid_thw[-1].item())
+
+        merge = int(self.backbone.visual.spatial_merge_size)
+        if H % merge != 0 or W % merge != 0:
+            raise ValueError(f"Pre-merge grid {(H,W)} not divisible by merge size {merge}.")
+
+        return (H, W), (H // merge, W // merge)
 
     def _build_multimodal_embeddings(self, batch: Dict[str, Any]) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -426,18 +440,21 @@ class QwenLVAR(nn.Module):
         """
         if "projected_image_tokens" in batch:
             return batch["projected_image_tokens"]
+        
+        
         pixel_values = batch.get("pixel_values")
         image_grid_thw = batch.get("image_grid_thw")
         if pixel_values is None:
             raise ValueError("pixel_values are required to extract projected image tokens.")
+        
         if image_grid_thw is not None:
-            if image_grid_thw.dim() == 2:
-                grid_h = int(image_grid_thw[0, -2].item())
-                grid_w = int(image_grid_thw[0, -1].item())
-            else:
-                grid_h = int(image_grid_thw[-2].item())
-                grid_w = int(image_grid_thw[-1].item())
-            self._current_image_grid = (grid_h, grid_w)
+            pre_grid, post_grid = self._resolve_image_grids(image_grid_thw)
+            self._current_premerge_grid = pre_grid
+            self._current_postmerge_grid = post_grid
+        else:
+            self._current_premerge_grid = None
+            self._current_postmerge_grid = None
+            
         if not hasattr(self.backbone, "visual"):
             raise ValueError("The backbone does not expose a visual encoder for projected image tokens.")
         # Support minor signature differences across backbone/test doubles.
@@ -450,6 +467,14 @@ class QwenLVAR(nn.Module):
                 image_tokens = self.backbone.visual(pixel_values)
         if image_tokens.dim() == 3:
             image_tokens = image_tokens[0]
+            
+        if self._current_postmerge_grid is not None:
+            expected = self._current_postmerge_grid[0] * self._current_postmerge_grid[1]
+            if image_tokens.size(0) != expected:
+                raise ValueError(
+                    f"Expected {expected} post-merge tokens for grid {self._current_postmerge_grid}, "
+                    f"got {image_tokens.size(0)}."
+                )
         return image_tokens.to(self.device, dtype=self.latent_token.dtype)
 
     def build_visual_bank(self, image_tokens: torch.Tensor) -> Dict[str, torch.Tensor]:
@@ -460,7 +485,8 @@ class QwenLVAR(nn.Module):
             global: attention-pooled summary over all patches
         """
         patch_tokens = image_tokens.squeeze(0) if image_tokens.dim() == 3 else image_tokens
-        grid_h, grid_w = self._infer_image_grid(patch_tokens)
+        # grid_h, grid_w = self._infer_image_grid(patch_tokens)
+        grid_h, grid_w = self._current_postmerge_grid
         if grid_h * grid_w != patch_tokens.size(0):
             raise ValueError("Projected image tokens do not match the expected patch grid.")
         region_window = self.region_window
