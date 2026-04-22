@@ -1,3 +1,4 @@
+import math
 from typing import Any, Dict, Optional, Tuple
 
 import torch
@@ -213,15 +214,83 @@ class QwenLVAR(nn.Module):
         weights = torch.softmax(scorer(tokens).squeeze(-1), dim=0)
         return torch.sum(weights.unsqueeze(-1) * tokens, dim=0)
 
+    def _pad_patch_grid_for_regions(
+        self,
+        patch_grid: torch.Tensor,
+        region_h: int,
+        region_w: int,
+    ) -> Tuple[torch.Tensor, int, int]:
+        """Pad grid by duplicating border patches so region windows tile exactly."""
+        grid_h, grid_w, _ = patch_grid.shape
+        pad_h = (-grid_h) % region_h
+        pad_w = (-grid_w) % region_w
+        if pad_h == 0 and pad_w == 0:
+            return patch_grid, grid_h, grid_w
+
+        padded_grid = patch_grid
+        if pad_h > 0:
+            padded_rows = padded_grid[-1:, :, :].expand(pad_h, -1, -1)
+            padded_grid = torch.cat([padded_grid, padded_rows], dim=0)
+        if pad_w > 0:
+            padded_cols = padded_grid[:, -1:, :].expand(-1, pad_w, -1)
+            padded_grid = torch.cat([padded_grid, padded_cols], dim=1)
+        return padded_grid, grid_h + pad_h, grid_w + pad_w
+
     def _infer_image_grid(self, image_tokens: torch.Tensor) -> Tuple[int, int]:
         """Infer or reuse patch grid dimensions required for region-window pooling."""
-        if self._current_image_grid is not None:
-            return self._current_image_grid
         num_patches = image_tokens.size(0)
+        # print("raw grid from metadata:", self._current_image_grid)
+        # print("num_patches:", num_patches)
+        if self._current_image_grid is not None:
+            grid_h, grid_w = self._current_image_grid
+            if grid_h * grid_w == num_patches:
+                return grid_h, grid_w
+
+            # Qwen2-VL can merge neighboring visual patches before exposing the
+            # projected tokens, so image_grid_thw may describe the pre-merge grid.
+            inferred = self._infer_merged_image_grid(grid_h, grid_w, num_patches)
+            if inferred is not None:
+                self._current_image_grid = inferred
+                return inferred
+
         side = int(num_patches ** 0.5)
         if side * side != num_patches:
             raise ValueError("Unable to infer a square patch grid for the visual bank.")
         return side, side
+
+    def _infer_merged_image_grid(
+        self,
+        grid_h: int,
+        grid_w: int,
+        num_patches: int,
+    ) -> Optional[Tuple[int, int]]:
+        """Resolve projected-token grids when the processor reports a pre-merge shape."""
+        original_area = grid_h * grid_w
+        if original_area % num_patches != 0:
+            return None
+
+        merge_area = original_area // num_patches
+        merge_side = int(math.isqrt(merge_area))
+        if merge_side > 0 and merge_side * merge_side == merge_area:
+            if grid_h % merge_side == 0 and grid_w % merge_side == 0:
+                return grid_h // merge_side, grid_w // merge_side
+
+        # Fall back to the divisor pair that best preserves the original aspect ratio.
+        aspect_ratio = grid_h / max(grid_w, 1)
+        best: Optional[Tuple[float, Tuple[int, int]]] = None
+        for candidate_h in range(1, int(math.isqrt(num_patches)) + 1):
+            if num_patches % candidate_h != 0:
+                continue
+            candidate_w = num_patches // candidate_h
+            for resolved_h, resolved_w in ((candidate_h, candidate_w), (candidate_w, candidate_h)):
+                if resolved_h > grid_h or resolved_w > grid_w:
+                    continue
+                if grid_h % resolved_h != 0 or grid_w % resolved_w != 0:
+                    continue
+                score = abs((resolved_h / max(resolved_w, 1)) - aspect_ratio)
+                if best is None or score < best[0]:
+                    best = (score, (resolved_h, resolved_w))
+        return None if best is None else best[1]
 
     def _build_multimodal_embeddings(self, batch: Dict[str, Any]) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -274,6 +343,23 @@ class QwenLVAR(nn.Module):
         else:
             index_tensor = torch.argmax(index_logits, dim=-1)
         return index_tensor, distribution.log_prob(index_tensor)
+
+    def _distribution_to_list(self, logits: torch.Tensor) -> list:
+        """Convert controller logits into a plain Python probability list."""
+        probabilities = torch.softmax(logits, dim=-1)
+        squeezed = probabilities.squeeze(0)
+        return [float(value) for value in squeezed.detach().cpu().tolist()]
+
+    def _inference_uses_sampling(self) -> bool:
+        """Resolve config action_selection into inference sampling mode."""
+        if isinstance(self.action_selection, bool):
+            return self.action_selection
+        mode = str(self.action_selection).strip().lower()
+        if mode in {"sample", "sampling", "stochastic"}:
+            return True
+        if mode in {"argmax", "greedy", "deterministic"}:
+            return False
+        return False
 
     def _write_recurrent_tokens(
         self,
@@ -381,18 +467,20 @@ class QwenLVAR(nn.Module):
         if isinstance(region_window, int):
             region_window = (region_window, region_window)
         region_h, region_w = region_window
-        if grid_h % region_h != 0 or grid_w % region_w != 0:
-            raise ValueError(
-                f"Region window {region_window} does not evenly tile the patch grid {(grid_h, grid_w)}."
-            )
+
         # Convert flat patch list into grid for non-overlapping region windows.
         patch_grid = patch_tokens.view(grid_h, grid_w, self.hidden_size)
+        patch_grid, region_grid_h, region_grid_w = self._pad_patch_grid_for_regions(
+            patch_grid,
+            region_h,
+            region_w,
+        )
         global_token = self._attention_pool(patch_tokens, self.global_pool).unsqueeze(0)
 
         # Pool each region window into one coarse vector.
         region_tokens = []
-        for row in range(0, grid_h, region_h):
-            for col in range(0, grid_w, region_w):
+        for row in range(0, region_grid_h, region_h):
+            for col in range(0, region_grid_w, region_w):
                 window = patch_grid[row : row + region_h, col : col + region_w, :].reshape(-1, self.hidden_size)
                 region_tokens.append(self._attention_pool(window, self.region_pool))
         regions = torch.stack(region_tokens, dim=0)
@@ -460,6 +548,9 @@ class QwenLVAR(nn.Module):
             torch.tensor([step_idx], device=self.device, dtype=torch.long)
         )
         type_logits, region_logits, patch_logits = self.controller(latent_hidden, act_hidden, step_hidden, bank)
+        action_probs = self._distribution_to_list(type_logits)
+        region_probs = self._distribution_to_list(region_logits)
+        patch_probs = self._distribution_to_list(patch_logits)
         action_tensor, action_log_prob = self._select_action(type_logits, state.get("sample_actions", False))
         action_id = int(action_tensor.item())
         action_name = ACTION_NAMES[action_id]
@@ -514,6 +605,9 @@ class QwenLVAR(nn.Module):
             "action_id": action_id,
             "action": action_name,
             "should_stop": should_stop,
+            "action_probs": action_probs,
+            "region_probs": region_probs,
+            "patch_probs": patch_probs,
             "region_index": region_index,
             "patch_index": patch_index,
             "sequence_length_before": sequence_length_before,
@@ -611,9 +705,17 @@ class QwenLVAR(nn.Module):
         prepared = self.prepare_inputs(images, questions)
         image_tokens = self.get_projected_image_tokens(prepared)
         prepared["projected_image_tokens"] = image_tokens
+        # print("image_tokens.shape:", image_tokens.shape)
+        # print("num_tokens:", image_tokens.squeeze(0).size(0))
+        # print("_current_image_grid:", self._current_image_grid)
+        # print("region_window:", self.region_window)
         bank = self.build_visual_bank(image_tokens)
         state = self.build_initial_state(prepared)
-        state["sample_actions"] = self.training if sample_actions is None else sample_actions
+        if sample_actions is None:
+            # During training we always sample; during inference defer to config.
+            state["sample_actions"] = self.training or self._inference_uses_sampling()
+        else:
+            state["sample_actions"] = sample_actions
 
         # Controller loop runs until STOP or max_steps.
         stopped = False
@@ -674,13 +776,14 @@ class QwenLVAR(nn.Module):
         was_training = self.training
         self.eval()
         with torch.no_grad():
-            output = self.forward(images, questions, sample_actions=False)
+            output = self.forward(images, questions, sample_actions=self._inference_uses_sampling())
         self.train(was_training)
         return {
             "prediction": output["answer"],
             "trace": output["trace"],
             "num_steps": output["num_steps"],
             "generated_text": output["generated_text"],
+            "generated_ids": output["generated_ids"],
         }
 
     def generate_baseline(self, images: Any, questions: Any) -> Dict[str, Any]:
@@ -693,4 +796,5 @@ class QwenLVAR(nn.Module):
         return {
             "prediction": output["answer"],
             "generated_text": output["generated_text"],
+            "generated_ids": output["generated_ids"],
         }

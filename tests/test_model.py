@@ -68,6 +68,13 @@ class DummyVision(torch.nn.Module):
         return self.image_tokens.clone()
 
 
+class DummyMergedGridProcessor(DummyProcessor):
+    def apply_chat_template(self, messages, add_generation_prompt, tokenize, return_dict, return_tensors):
+        batch = super().apply_chat_template(messages, add_generation_prompt, tokenize, return_dict, return_tensors)
+        batch["image_grid_thw"] = torch.tensor([[1, 4, 4]], dtype=torch.long)
+        return batch
+
+
 class DummyBackbone(torch.nn.Module):
     def __init__(self):
         super().__init__()
@@ -120,6 +127,18 @@ def build_model():
     return QwenLVAR(cfg, backbone=DummyBackbone(), processor=DummyProcessor())
 
 
+def build_merged_grid_model():
+    cfg = {
+        "device": "cpu",
+        "dtype": "float32",
+        "max_steps": 3,
+        "region_window": 1,
+        "max_answer_tokens": 1,
+        "action_selection": "argmax",
+    }
+    return QwenLVAR(cfg, backbone=DummyBackbone(), processor=DummyMergedGridProcessor())
+
+
 class QwenLVARTests(unittest.TestCase):
     def setUp(self):
         self.model = build_model()
@@ -144,6 +163,26 @@ class QwenLVARTests(unittest.TestCase):
         self.assertEqual(tuple(self.bank["patches"].shape), (4, 4))
         self.assertEqual(tuple(self.bank["regions"].shape), (4, 4))
         self.assertEqual(tuple(self.bank["global"].shape), (1, 4))
+
+    def test_build_visual_bank_infers_merged_patch_grid(self):
+        model = build_merged_grid_model()
+        prepared = model.prepare_inputs("image", "question")
+        projected = model.get_projected_image_tokens(prepared)
+        bank = model.build_visual_bank(projected)
+        self.assertEqual(tuple(model._current_image_grid), (2, 2))
+        self.assertEqual(tuple(bank["patches"].shape), (4, 4))
+
+    def test_build_visual_bank_pads_non_divisible_grid(self):
+        model = build_model()
+        model.region_window = 2
+        model._current_image_grid = (3, 5)
+        projected = torch.arange(60, dtype=torch.float32).view(15, 4)
+
+        bank = model.build_visual_bank(projected)
+
+        self.assertEqual(tuple(bank["patches"].shape), (15, 4))
+        self.assertEqual(tuple(bank["regions"].shape), (6, 4))
+        self.assertEqual(tuple(bank["global"].shape), (1, 4))
 
     def test_forward_reasoning_actions(self):
         for action_id in [ACTION_THINK, ACTION_STOP, ACTION_GLOBAL, ACTION_REGION, ACTION_PATCH]:
@@ -206,6 +245,31 @@ class QwenLVARTests(unittest.TestCase):
         self.assertEqual(baseline["decode_prefix_length"], self.prepared["input_ids"].size(1))
         self.assertEqual(baseline["num_steps"], 0)
         self.assertEqual(baseline["trace"], [])
+
+    def test_generate_lvar_respects_action_selection(self):
+        model = build_model()
+        captured = {}
+
+        def fake_forward(images, questions, labels=None, sample_actions=None):
+            del images, questions, labels
+            captured["sample_actions"] = sample_actions
+            return {
+                "answer": "yes",
+                "trace": [],
+                "num_steps": 0,
+                "generated_text": "<answer>yes</answer>",
+                "generated_ids": [1],
+            }
+
+        model.forward = fake_forward
+
+        model.action_selection = "sample"
+        model.generate_lvar("image", "question")
+        self.assertTrue(captured["sample_actions"])
+
+        model.action_selection = "argmax"
+        model.generate_lvar("image", "question")
+        self.assertFalse(captured["sample_actions"])
 
 
 if __name__ == "__main__":

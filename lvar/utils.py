@@ -39,14 +39,40 @@ def normalize_answer_text(text: Optional[str]) -> str:
     return normalized
 
 
+def _format_probability_distribution(
+    values: Optional[Iterable[object]],
+    labels: Optional[Iterable[object]] = None,
+    precision: int = 2,
+    top_k: Optional[int] = None,
+) -> str:
+    """Render probability values as a compact [label:prob, ...] list."""
+    if values is None:
+        return "[]"
+    value_list = list(values)
+    label_list = list(labels) if labels is not None else list(range(len(value_list)))
+    pairs = [(label, float(value)) for label, value in zip(label_list, value_list)]
+    if top_k is not None and top_k > 0 and len(pairs) > top_k:
+        pairs = sorted(pairs, key=lambda item: item[1], reverse=True)[:top_k]
+    rendered = []
+    for label, value in pairs:
+        rendered.append(f"{label}:{value:.{precision}f}")
+    return "[" + ", ".join(rendered) + "]"
+
+
 def format_trace_step(step_trace: Dict[str, object]) -> str:
     """Render one reasoning step dict into a compact human-readable debug line."""
     action = step_trace.get("action", "UNKNOWN")
+    action_labels = [ACTION_NAMES[idx] for idx in sorted(ACTION_NAMES)]
+    action_probs = _format_probability_distribution(step_trace.get("action_probs"), action_labels)
+    region_probs = _format_probability_distribution(step_trace.get("region_probs"), top_k=2)
+    patch_probs = _format_probability_distribution(step_trace.get("patch_probs"), top_k=2)
     parts: List[str] = [
         f"step={step_trace.get('step_idx', '?')}",
-        f"action={action}",
-        f"stop={step_trace.get('should_stop', False)}",
-        f"seq_len={step_trace.get('sequence_length_after', step_trace.get('sequence_length_before', '?'))}",
+        f"act={action}",
+        # f"seq_len={step_trace.get('sequence_length_after', step_trace.get('sequence_length_before', '?'))}",
+        f"act_prob={action_probs}",
+        f"region_prob={region_probs}",
+        f"patch_prob={patch_probs}",
     ]
     if step_trace.get("region_index") is not None:
         parts.append(f"region={step_trace['region_index']}")

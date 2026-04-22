@@ -2,10 +2,10 @@ model:
   model_id: Qwen/Qwen2-VL-2B-Instruct
   device: auto
   dtype: auto
-  max_steps: 4
+  max_steps: 8
   region_window: 2
   max_answer_tokens: 16
-  action_selection: argmax
+  action_selection: sample
 
 dataset:
   name: MMInstruction/Clevr_CoGenT_TrainA_70K_Complex
