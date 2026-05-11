@@ -278,6 +278,19 @@ class QwenLVARTests(unittest.TestCase):
         self.assertEqual(mean_output["num_steps"], 0)
         self.assertEqual(max_output["trace"], [])
 
+    def test_region_baseline_replaces_image_span_with_region_tokens(self):
+        model = build_model()
+        model.region_window = 2
+
+        mean_output = model.region_baseline_forward("image", "question", pooling="mean")
+        max_output = model.region_baseline_forward("image", "question", pooling="max")
+
+        self.assertEqual(mean_output["num_region_tokens"], 1)
+        self.assertEqual(max_output["num_region_tokens"], 1)
+        self.assertEqual(mean_output["decode_prefix_length"], 3)
+        self.assertEqual(max_output["decode_prefix_length"], 3)
+        self.assertEqual(mean_output["trace"], [])
+
     def test_baseline_excludes_latent_and_act_tokens(self):
         baseline = self.model.baseline_forward("image", "question")
         self.assertEqual(baseline["decode_prefix_length"], self.prepared["input_ids"].size(1))

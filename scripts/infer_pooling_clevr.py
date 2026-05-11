@@ -31,9 +31,11 @@ def write_jsonl(path: Path, rows):
 
 
 def main() -> None:
-    """Run CLEVR inference comparing full-image and pooled-image decode baselines."""
+    """Run CLEVR inference comparing full-image, pooled-image, and region-token baselines."""
     # Allow script-level limit/output overrides while defaulting to config values.
-    parser = argparse.ArgumentParser(description="Compare CLEVR accuracy for full-image and pooled visual inputs.")
+    parser = argparse.ArgumentParser(
+        description="Compare CLEVR accuracy for full-image, pooled-image, and region-token inputs."
+    )
     parser.add_argument("--config", default="configs/qwen2vl_lvar.yaml")
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--output", default=None)
@@ -64,18 +66,26 @@ def main() -> None:
         "full_image_correct": 0,
         "mean_pooled_correct": 0,
         "max_pooled_correct": 0,
+        "region_mean_pooled_correct": 0,
+        "region_max_pooled_correct": 0,
     }
     for example in tqdm(dataset, total=len(dataset), desc="Inferring"):
         full_image_output = model.generate_baseline(example["image"], example["question"])
         mean_pooled_output = model.generate_pooled_baseline(example["image"], example["question"], pooling="mean")
         max_pooled_output = model.generate_pooled_baseline(example["image"], example["question"], pooling="max")
+        region_mean_output = model.generate_region_baseline(example["image"], example["question"], pooling="mean")
+        region_max_output = model.generate_region_baseline(example["image"], example["question"], pooling="max")
 
         full_image_correct = correctness_reward(full_image_output["prediction"], example["gold_answer"])
         mean_pooled_correct = correctness_reward(mean_pooled_output["prediction"], example["gold_answer"])
         max_pooled_correct = correctness_reward(max_pooled_output["prediction"], example["gold_answer"])
+        region_mean_correct = correctness_reward(region_mean_output["prediction"], example["gold_answer"])
+        region_max_correct = correctness_reward(region_max_output["prediction"], example["gold_answer"])
         totals["full_image_correct"] += int(full_image_correct)
         totals["mean_pooled_correct"] += int(mean_pooled_correct)
         totals["max_pooled_correct"] += int(max_pooled_correct)
+        totals["region_mean_pooled_correct"] += int(region_mean_correct)
+        totals["region_max_pooled_correct"] += int(region_max_correct)
         row = {
             "example_id": example["id"],
             "question": example["question"],
@@ -83,12 +93,19 @@ def main() -> None:
             "full_image_prediction": full_image_output["prediction"],
             "mean_pooled_prediction": mean_pooled_output["prediction"],
             "max_pooled_prediction": max_pooled_output["prediction"],
+            "region_mean_pooled_prediction": region_mean_output["prediction"],
+            "region_max_pooled_prediction": region_max_output["prediction"],
             "full_image_correct": bool(full_image_correct),
             "mean_pooled_correct": bool(mean_pooled_correct),
             "max_pooled_correct": bool(max_pooled_correct),
+            "region_mean_pooled_correct": bool(region_mean_correct),
+            "region_max_pooled_correct": bool(region_max_correct),
             "full_image_generated_text": full_image_output["generated_text"],
             "mean_pooled_generated_text": mean_pooled_output["generated_text"],
             "max_pooled_generated_text": max_pooled_output["generated_text"],
+            "region_mean_pooled_generated_text": region_mean_output["generated_text"],
+            "region_max_pooled_generated_text": region_max_output["generated_text"],
+            "num_region_tokens": region_mean_output["num_region_tokens"],
         }
         rows.append(row)
 
@@ -102,6 +119,16 @@ def main() -> None:
         print(f"  full_image: {totals['full_image_correct'] / count:.4f} ({totals['full_image_correct']}/{count})")
         print(f"  mean_pooled: {totals['mean_pooled_correct'] / count:.4f} ({totals['mean_pooled_correct']}/{count})")
         print(f"  max_pooled: {totals['max_pooled_correct'] / count:.4f} ({totals['max_pooled_correct']}/{count})")
+        print(
+            "  region_mean_pooled: "
+            f"{totals['region_mean_pooled_correct'] / count:.4f} "
+            f"({totals['region_mean_pooled_correct']}/{count})"
+        )
+        print(
+            "  region_max_pooled: "
+            f"{totals['region_max_pooled_correct'] / count:.4f} "
+            f"({totals['region_max_pooled_correct']}/{count})"
+        )
 
 
 if __name__ == "__main__":

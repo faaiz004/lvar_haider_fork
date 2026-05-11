@@ -334,31 +334,43 @@ class QwenLVAR(nn.Module):
             raise ValueError("The backbone config does not expose image_token_id.")
 
         image_tokens = image_tokens.squeeze(0) if image_tokens.dim() == 3 else image_tokens
+        pooled_token = self._pool_tokens(image_tokens, mode=pooling).view(1, 1, -1)
+        return self._build_visual_token_multimodal_embeddings(batch, pooled_token)
+
+    def _build_visual_token_multimodal_embeddings(
+        self,
+        batch: Dict[str, Any],
+        visual_tokens: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Replace the image placeholder span with a custom visual-token sequence."""
+        input_ids = batch["input_ids"]
+        attention_mask = batch["attention_mask"].to(self.device)
+        if input_ids.size(0) != 1:
+            raise ValueError("Custom visual-token decode baselines currently support batch size 1.")
+        if self.image_token_id is None:
+            raise ValueError("The backbone config does not expose image_token_id.")
+
+        visual_tokens = visual_tokens.squeeze(0) if visual_tokens.dim() == 3 else visual_tokens
         image_positions = torch.nonzero(input_ids[0] == self.image_token_id, as_tuple=False).flatten()
-        if image_positions.numel() != image_tokens.size(0):
-            raise ValueError(
-                f"Expected {image_positions.numel()} projected image tokens but received {image_tokens.size(0)}."
-            )
         if image_positions.numel() == 0:
             raise ValueError("No image placeholder tokens were found.")
 
         start = int(image_positions[0].item())
         end = int(image_positions[-1].item()) + 1
-        pooled_token = self._pool_tokens(image_tokens, mode=pooling).view(1, 1, -1)
         embeddings = self._embed_input_ids(input_ids)
         inputs_embeds = torch.cat(
             [
                 embeddings[:, :start, :],
-                pooled_token.to(embeddings.dtype),
+                visual_tokens.unsqueeze(0).to(embeddings.dtype),
                 embeddings[:, end:, :],
             ],
             dim=1,
         )
-        pooled_mask = torch.ones((1, 1), device=self.device, dtype=attention_mask.dtype)
+        visual_mask = torch.ones((1, visual_tokens.size(0)), device=self.device, dtype=attention_mask.dtype)
         pooled_attention_mask = torch.cat(
             [
                 attention_mask[:, :start],
-                pooled_mask,
+                visual_mask,
                 attention_mask[:, end:],
             ],
             dim=1,
@@ -562,6 +574,18 @@ class QwenLVAR(nn.Module):
             global: pooled summary over all patches
         """
         patch_tokens = image_tokens.squeeze(0) if image_tokens.dim() == 3 else image_tokens
+        regions = self.build_region_tokens(patch_tokens, pooling=self.pooling)
+        global_token = self._pool_tokens(patch_tokens, self.global_pool).unsqueeze(0)
+
+        return {
+            "global": global_token,
+            "regions": regions,
+            "patches": patch_tokens,
+        }
+
+    def build_region_tokens(self, image_tokens: torch.Tensor, pooling: str) -> torch.Tensor:
+        """Pool local image-token windows into a shorter region-token sequence."""
+        patch_tokens = image_tokens.squeeze(0) if image_tokens.dim() == 3 else image_tokens
         grid = self._current_postmerge_grid or self._current_image_grid
         if grid is None:
             raise ValueError("Current image grid is unknown; call get_projected_image_tokens first.")
@@ -580,21 +604,14 @@ class QwenLVAR(nn.Module):
             region_h,
             region_w,
         )
-        global_token = self._pool_tokens(patch_tokens, self.global_pool).unsqueeze(0)
 
         # Pool each region window into one coarse vector.
         region_tokens = []
         for row in range(0, region_grid_h, region_h):
             for col in range(0, region_grid_w, region_w):
                 window = patch_grid[row : row + region_h, col : col + region_w, :].reshape(-1, self.hidden_size)
-                region_tokens.append(self._pool_tokens(window, self.region_pool))
-        regions = torch.stack(region_tokens, dim=0)
-
-        return {
-            "global": global_token,
-            "regions": regions,
-            "patches": patch_tokens,
-        }
+                region_tokens.append(self._pool_tokens(window, self.region_pool, mode=pooling))
+        return torch.stack(region_tokens, dim=0)
 
     def build_initial_state(self, batch: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -918,6 +935,37 @@ class QwenLVAR(nn.Module):
             "final_sequence_length": decoded["final_sequence_length"],
         }
 
+    def region_baseline_forward(
+        self,
+        images: Any,
+        questions: Any,
+        pooling: str,
+        labels: Optional[Any] = None,
+    ) -> Dict[str, Any]:
+        """Decode from a prompt where image tokens are replaced by pooled region tokens."""
+        prepared = self.prepare_inputs(images, questions)
+        image_tokens = self.get_projected_image_tokens(prepared)
+        prepared["projected_image_tokens"] = image_tokens
+        region_tokens = self.build_region_tokens(image_tokens, pooling=pooling)
+        inputs_embeds, attention_mask = self._build_visual_token_multimodal_embeddings(prepared, region_tokens)
+        state = {
+            "inputs_embeds": inputs_embeds,
+            "attention_mask": attention_mask,
+            "latent_pos": None,
+            "act_pos": None,
+        }
+        decoded = self.decode_answer(state, labels=labels)
+        return {
+            "answer": decoded["answer"],
+            "generated_text": decoded["generated_text"],
+            "generated_ids": decoded["generated_ids"],
+            "trace": [],
+            "num_steps": 0,
+            "decode_prefix_length": decoded["decode_prefix_length"],
+            "final_sequence_length": decoded["final_sequence_length"],
+            "num_region_tokens": region_tokens.size(0),
+        }
+
     def generate_lvar(self, images: Any, questions: Any) -> Dict[str, Any]:
         """Inference wrapper for LVAR with deterministic (argmax) controller behavior."""
         was_training = self.training
@@ -958,4 +1006,19 @@ class QwenLVAR(nn.Module):
             "generated_text": output["generated_text"],
             "generated_ids": output["generated_ids"],
             "decode_prefix_length": output["decode_prefix_length"],
+        }
+
+    def generate_region_baseline(self, images: Any, questions: Any, pooling: str) -> Dict[str, Any]:
+        """Inference wrapper for a decode-only region-token baseline."""
+        was_training = self.training
+        self.eval()
+        with torch.no_grad():
+            output = self.region_baseline_forward(images, questions, pooling=pooling)
+        self.train(was_training)
+        return {
+            "prediction": output["answer"],
+            "generated_text": output["generated_text"],
+            "generated_ids": output["generated_ids"],
+            "decode_prefix_length": output["decode_prefix_length"],
+            "num_region_tokens": output["num_region_tokens"],
         }
