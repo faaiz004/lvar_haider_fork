@@ -121,9 +121,13 @@ class QwenLVAR(nn.Module):
         self.region_window = cfg.get("region_window", 2)
         self.max_answer_tokens = int(cfg.get("max_answer_tokens", 16))
         self.action_selection = cfg.get("action_selection", "argmax")
+        self.controller_temperature = float(cfg.get("controller_temperature", 1.0))
         self.pooling = self._resolve_pooling(cfg.get("pooling", "mean"))
         self.use_control_tokens = bool(cfg.get("use_control_tokens", False))
         self.think_append_hidden = bool(cfg.get("think_append_hidden", True))
+
+        if self.controller_temperature <= 0.0:
+            raise ValueError("controller_temperature must be greater than 0.")
 
         # Load real HF components unless tests inject a stub backbone/processor pair.
         if backbone is None:
@@ -411,6 +415,10 @@ class QwenLVAR(nn.Module):
         squeezed = probabilities.squeeze(0)
         return [float(value) for value in squeezed.detach().cpu().tolist()]
 
+    def _scale_controller_logits(self, logits: torch.Tensor) -> torch.Tensor:
+        """Apply temperature scaling so larger values produce flatter controller distributions."""
+        return logits / self.controller_temperature
+
     def _inference_uses_sampling(self) -> bool:
         """Resolve config action_selection into inference sampling mode."""
         if isinstance(self.action_selection, bool):
@@ -686,10 +694,16 @@ class QwenLVAR(nn.Module):
             bank,
             act_hidden=act_hidden,
         )
-        action_probs = self._distribution_to_list(type_logits)
-        region_probs = self._distribution_to_list(region_logits)
-        patch_probs = self._distribution_to_list(patch_logits)
-        action_tensor, action_log_prob = self._select_action(type_logits, state.get("sample_actions", False))
+        scaled_type_logits = self._scale_controller_logits(type_logits)
+        scaled_region_logits = self._scale_controller_logits(region_logits)
+        scaled_patch_logits = self._scale_controller_logits(patch_logits)
+        action_probs = self._distribution_to_list(scaled_type_logits)
+        region_probs = self._distribution_to_list(scaled_region_logits)
+        patch_probs = self._distribution_to_list(scaled_patch_logits)
+        action_tensor, action_log_prob = self._select_action(
+            scaled_type_logits,
+            state.get("sample_actions", False),
+        )
         action_id = int(action_tensor.item())
         action_name = ACTION_NAMES[action_id]
         should_stop = action_id == ACTION_STOP
@@ -701,12 +715,18 @@ class QwenLVAR(nn.Module):
         if action_id == ACTION_GLOBAL:
             evidence_token = bank["global"][0]
         elif action_id == ACTION_REGION:
-            region_tensor, region_log_prob = self._select_index(region_logits, state.get("sample_actions", False))
+            region_tensor, region_log_prob = self._select_index(
+                scaled_region_logits,
+                state.get("sample_actions", False),
+            )
             region_index = int(region_tensor.item())
             action_log_prob = action_log_prob + region_log_prob
             evidence_token = bank["regions"][region_index]
         elif action_id == ACTION_PATCH:
-            patch_tensor, patch_log_prob = self._select_index(patch_logits, state.get("sample_actions", False))
+            patch_tensor, patch_log_prob = self._select_index(
+                scaled_patch_logits,
+                state.get("sample_actions", False),
+            )
             patch_index = int(patch_tensor.item())
             action_log_prob = action_log_prob + patch_log_prob
             evidence_token = bank["patches"][patch_index]
@@ -742,6 +762,7 @@ class QwenLVAR(nn.Module):
             "action_probs": action_probs,
             "region_probs": region_probs,
             "patch_probs": patch_probs,
+            "controller_temperature": self.controller_temperature,
             "region_index": region_index,
             "patch_index": patch_index,
             "sequence_length_before": sequence_length_before,

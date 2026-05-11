@@ -1,11 +1,17 @@
 import argparse
 import random
+import sys
 from pathlib import Path
 
 import torch
 import yaml
 
-from lvar.dataset import CLEVRCoGenTDataset
+# Allow running as a script: `python scripts/train_grpo.py ...`.
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from lvar.dataset import build_dataset
 from lvar.qwen_lvar import QwenLVAR
 from lvar.rewards import correctness_reward
 
@@ -48,7 +54,7 @@ def main() -> None:
     """Train controller-facing LVAR parameters using custom grouped rollouts."""
     # Parse minimal CLI and validate optional dependency required by this script.
     parser = argparse.ArgumentParser(description="Train the LVAR controller with custom GRPO-style updates.")
-    parser.add_argument("--config", default="configs/qwen2vl_lvar.yaml")
+    parser.add_argument("--config", default="configs/qwen2vl_clevr.yaml")
     args = parser.parse_args()
 
     if Accelerator is None:
@@ -73,13 +79,13 @@ def main() -> None:
         weight_decay=float(train_cfg.get("weight_decay", 0.0)),
     )
 
-    dataset = CLEVRCoGenTDataset(
-        split=dataset_cfg.get("split", "train"),
+    dataset_options = dict(dataset_cfg)
+    dataset_options["test_fraction"] = test_fraction
+    dataset_options["split_seed"] = split_seed
+    dataset = build_dataset(
+        dataset_options,
         limit=train_cfg.get("max_examples", dataset_cfg.get("limit")),
-        dataset_name=dataset_cfg.get("name", "MMInstruction/Clevr_CoGenT_TrainA_70K_Complex"),
         partition=dataset_partition,
-        test_fraction=test_fraction,
-        split_seed=split_seed,
     )
 
     output_dir = Path(train_cfg.get("output_dir", "outputs/train"))

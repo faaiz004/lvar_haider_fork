@@ -6,18 +6,16 @@ model:
   region_window: 2
   max_answer_tokens: 16
   action_selection: sample
+  controller_temperature: 3.0
   pooling: mean
   use_control_tokens: false
   think_append_hidden: true
 
 dataset:
-  name: MMInstruction/Clevr_CoGenT_TrainA_70K_Complex
+  type: m3cot
+  name: LightChen2333/M3CoT
   split: train
   limit:
-  train_partition: train
-  eval_partition: test
-  split_seed: 42
-  test_fraction: 0.1
 
 train:
   seed: 42
@@ -28,17 +26,11 @@ train:
   max_examples:
   grad_clip_norm: 1.0
   log_every: 10
-  output_dir: outputs/train
-  dataset_partition: train
-  split_seed: 42
-  test_fraction: 0.1
+  output_dir: outputs/train_m3cot
 
 inference:
   limit:
-  output_path: outputs/clevr_predictions.jsonl
-  dataset_partition: test
-  split_seed: 42
-  test_fraction: 0.1
+  output_path: outputs/m3cot_pooling_predictions.jsonl
 
 debug:
   index: 0

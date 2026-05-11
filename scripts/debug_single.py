@@ -11,7 +11,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from lvar.dataset import CLEVRCoGenTDataset
+from lvar.dataset import build_dataset
 from lvar.qwen_lvar import QwenLVAR
 from lvar.utils import format_trace_step
 
@@ -26,7 +26,7 @@ def main() -> None:
     """Run one example and print a human-readable LVAR reasoning trace."""
     # CLI inputs: config path plus optional explicit example index override.
     parser = argparse.ArgumentParser(description="Run a single LVAR debug example.")
-    parser.add_argument("--config", default="configs/qwen2vl_lvar.yaml")
+    parser.add_argument("--config", default="configs/qwen2vl_clevr.yaml")
     parser.add_argument("--index", type=int, default=None)
     args = parser.parse_args()
 
@@ -34,11 +34,7 @@ def main() -> None:
     dataset_cfg = config["dataset"]
 
     # Build dataset and model exactly like main inference path so debug reflects real behavior.
-    dataset = CLEVRCoGenTDataset(
-        split=dataset_cfg.get("split", "train"),
-        limit=dataset_cfg.get("limit"),
-        dataset_name=dataset_cfg.get("name", "MMInstruction/Clevr_CoGenT_TrainA_70K_Complex"),
-    )
+    dataset = build_dataset(dataset_cfg, limit=dataset_cfg.get("limit"))
     index = args.index if args.index is not None else random.randrange(len(dataset))
     example = dataset[index]
 

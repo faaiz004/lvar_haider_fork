@@ -253,6 +253,33 @@ class QwenLVARTests(unittest.TestCase):
                     self.assertTrue(torch.allclose(updated_state["inputs_embeds"][:, -1, :], initial_final_embed))
                 self.assertEqual(should_stop, action_id == ACTION_STOP)
 
+    def test_controller_temperature_flattens_action_distribution(self):
+        cold_model = build_model(controller_temperature=0.5)
+        hot_model = build_model(controller_temperature=2.0)
+
+        def forward(state_hidden, step_hidden, bank, act_hidden=None):
+            del state_hidden, step_hidden, bank, act_hidden
+            type_logits = torch.tensor([[2.0, 0.0, 0.0, 0.0, 0.0]])
+            region_logits = torch.tensor([[1.0, 0.0, 0.0, 0.0]])
+            patch_logits = torch.tensor([[1.0, 0.0, 0.0, 0.0]])
+            return type_logits, region_logits, patch_logits
+
+        cold_model.controller.forward = forward
+        hot_model.controller.forward = forward
+
+        cold_state = cold_model.build_initial_state(self.prepared)
+        hot_state = hot_model.build_initial_state(self.prepared)
+        cold_model._current_postmerge_grid = self.model._current_postmerge_grid
+        hot_model._current_postmerge_grid = self.model._current_postmerge_grid
+
+        _, _, _, cold_trace = cold_model.forward_reasoning_step(cold_state, cold_model.build_visual_bank(self.projected), 0)
+        _, _, _, hot_trace = hot_model.forward_reasoning_step(hot_state, hot_model.build_visual_bank(self.projected), 0)
+
+        self.assertGreater(cold_trace["action_probs"][0], hot_trace["action_probs"][0])
+        self.assertLess(cold_trace["action_probs"][1], hot_trace["action_probs"][1])
+        self.assertEqual(cold_trace["controller_temperature"], 0.5)
+        self.assertEqual(hot_trace["controller_temperature"], 2.0)
+
     def test_legacy_control_tokens_still_drop_act_token(self):
         model = build_model(use_control_tokens=True, think_append_hidden=False)
         prepared = model.prepare_inputs("image", "question")

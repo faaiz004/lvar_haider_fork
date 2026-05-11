@@ -83,3 +83,84 @@ class CLEVRCoGenTDataset(Dataset):
             "solution": solution,
             "gold_answer": gold_answer,
         }
+
+
+class M3CoTDataset(Dataset):
+    """Dataset wrapper that exposes M3CoT rows in the LVAR-ready format."""
+
+    def __init__(
+        self,
+        split: str = "train",
+        limit: Optional[int] = None,
+        dataset_name: str = "LightChen2333/M3CoT",
+    ) -> None:
+        if load_dataset is None:
+            raise ImportError(
+                "datasets is required to load LightChen2333/M3CoT. Install the requirements first."
+            )
+        self.dataset = load_dataset(dataset_name, split=split)
+        if limit is not None:
+            self.dataset = self.dataset.select(range(min(limit, len(self.dataset))))
+
+    def __len__(self) -> int:
+        """Return number of examples available after optional truncation."""
+        return len(self.dataset)
+
+    def __getitem__(self, index: int) -> Dict[str, Any]:
+        """
+        Return one M3CoT example using the shared LVAR example contract.
+
+        M3CoT answers are multiple-choice labels (A/B/C/...), so the choices are
+        folded into the question text and the gold answer is the normalized label.
+        """
+        row = self.dataset[index]
+        choices = list(row.get("choices") or [])
+        question_parts = []
+        context = str(row.get("context") or "").strip()
+        if context:
+            question_parts.append(f"Context: {context}")
+        question_parts.append(str(row["question"]).strip())
+        if choices:
+            rendered_choices = []
+            for choice_index, choice in enumerate(choices):
+                label = chr(ord("A") + choice_index)
+                rendered_choices.append(f"{label}. {choice}")
+            question_parts.append("Choices:\n" + "\n".join(rendered_choices))
+        question_parts.append("Answer with the letter of the correct choice.")
+
+        answer = str(row["answer"]).strip()
+        rationale = str(row.get("rationale") or "").strip()
+        solution = f"{rationale}\n<answer>{answer}</answer>" if rationale else f"<answer>{answer}</answer>"
+        return {
+            "id": row.get("id", index),
+            "image": row["image"],
+            "question": "\n".join(question_parts),
+            "solution": solution,
+            "gold_answer": normalize_answer_text(answer),
+            "choices": choices,
+            "domain": row.get("domain"),
+            "topic": row.get("topic"),
+        }
+
+
+def build_dataset(dataset_cfg: Dict[str, Any], limit: Optional[int] = None, partition: Optional[str] = None) -> Dataset:
+    """Instantiate the configured dataset behind a shared script-facing API."""
+    dataset_type = str(dataset_cfg.get("type", "clevr")).strip().lower()
+    dataset_limit = dataset_cfg.get("limit") if limit is None else limit
+    if dataset_type in {"clevr", "clevr_cogent", "clevr-cogent"}:
+        return CLEVRCoGenTDataset(
+            split=dataset_cfg.get("split", "train"),
+            limit=dataset_limit,
+            dataset_name=dataset_cfg.get("name", "MMInstruction/Clevr_CoGenT_TrainA_70K_Complex"),
+            partition=partition or dataset_cfg.get("partition", "all"),
+            test_fraction=float(dataset_cfg.get("test_fraction", 0.1)),
+            split_seed=int(dataset_cfg.get("split_seed", 42)),
+        )
+    if dataset_type in {"m3cot", "m3-cot"}:
+        split = partition if partition in {"train", "validation", "test"} else dataset_cfg.get("split", "train")
+        return M3CoTDataset(
+            split=split,
+            limit=dataset_limit,
+            dataset_name=dataset_cfg.get("name", "LightChen2333/M3CoT"),
+        )
+    raise ValueError(f"Unsupported dataset type: {dataset_type}")

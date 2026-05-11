@@ -11,7 +11,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from lvar.dataset import CLEVRCoGenTDataset
+from lvar.dataset import build_dataset
 from lvar.qwen_lvar import QwenLVAR
 from lvar.rewards import correctness_reward
 
@@ -36,7 +36,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Compare CLEVR accuracy for full-image, pooled-image, and region-token inputs."
     )
-    parser.add_argument("--config", default="configs/qwen2vl_lvar.yaml")
+    parser.add_argument("--config", default="configs/qwen2vl_clevr.yaml")
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--output", default=None)
     args = parser.parse_args()
@@ -50,14 +50,10 @@ def main() -> None:
     test_fraction = float(inference_cfg.get("test_fraction", dataset_cfg.get("test_fraction", 0.1)))
 
     dataset_limit = args.limit if args.limit is not None else dataset_cfg.get("limit")
-    dataset = CLEVRCoGenTDataset(
-        split=dataset_cfg.get("split", "train"),
-        limit=dataset_limit,
-        dataset_name=dataset_cfg.get("name", "MMInstruction/Clevr_CoGenT_TrainA_70K_Complex"),
-        partition=dataset_partition,
-        test_fraction=test_fraction,
-        split_seed=split_seed,
-    )
+    dataset_options = dict(dataset_cfg)
+    dataset_options["test_fraction"] = test_fraction
+    dataset_options["split_seed"] = split_seed
+    dataset = build_dataset(dataset_options, limit=dataset_limit, partition=dataset_partition)
     model = QwenLVAR(config["model"])
 
     # Evaluate one example at a time (v1 design) and collect metrics for JSONL output.
