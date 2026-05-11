@@ -45,6 +45,32 @@ class DatasetTests(unittest.TestCase):
         self.assertEqual(example["solution"], "<answer> 3 </answer>")
         self.assertEqual(example["gold_answer"], "3")
 
+    @patch("lvar.dataset.load_dataset")
+    def test_train_test_partitions_are_deterministic_and_disjoint(self, mock_load_dataset):
+        rows = [
+            {
+                "id": f"sample-{index}",
+                "image": "fake-image",
+                "problem": f"Question {index}",
+                "solution": "<answer> yes </answer>",
+            }
+            for index in range(20)
+        ]
+        mock_load_dataset.return_value = FakeHFDataset(rows)
+
+        train_dataset = CLEVRCoGenTDataset(partition="train", test_fraction=0.25, split_seed=7)
+        test_dataset = CLEVRCoGenTDataset(partition="test", test_fraction=0.25, split_seed=7)
+
+        train_ids = {example["id"] for example in train_dataset}
+        test_ids = {example["id"] for example in test_dataset}
+
+        self.assertEqual(len(train_ids.intersection(test_ids)), 0)
+        self.assertEqual(len(train_dataset) + len(test_dataset), len(rows))
+
+        repeated_train_dataset = CLEVRCoGenTDataset(partition="train", test_fraction=0.25, split_seed=7)
+        repeated_train_ids = {example["id"] for example in repeated_train_dataset}
+        self.assertEqual(train_ids, repeated_train_ids)
+
 
 if __name__ == "__main__":
     unittest.main()

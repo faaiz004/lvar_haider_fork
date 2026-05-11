@@ -1,3 +1,4 @@
+import random
 from typing import Any, Dict, Optional
 
 from torch.utils.data import Dataset
@@ -18,6 +19,9 @@ class CLEVRCoGenTDataset(Dataset):
         split: str = "train",
         limit: Optional[int] = None,
         dataset_name: str = "MMInstruction/Clevr_CoGenT_TrainA_70K_Complex",
+        partition: str = "all",
+        test_fraction: float = 0.1,
+        split_seed: int = 42,
     ) -> None:
         """
         Load a Hugging Face split and optionally truncate it for quick experiments.
@@ -31,6 +35,26 @@ class CLEVRCoGenTDataset(Dataset):
                 "Install the requirements first."
             )
         self.dataset = load_dataset(dataset_name, split=split)
+
+        # Deterministic partitioning ensures reproducible, non-overlapping train/test subsets.
+        if partition not in {"all", "train", "test"}:
+            raise ValueError("partition must be one of: all, train, test")
+        if not (0.0 < test_fraction < 1.0):
+            raise ValueError("test_fraction must be in the open interval (0, 1)")
+
+        if partition != "all":
+            total_size = len(self.dataset)
+            all_indices = list(range(total_size))
+            rng = random.Random(split_seed)
+            rng.shuffle(all_indices)
+
+            test_size = int(total_size * test_fraction)
+            test_size = max(1, min(test_size, total_size - 1))
+            test_indices = all_indices[:test_size]
+            train_indices = all_indices[test_size:]
+            selected_indices = train_indices if partition == "train" else test_indices
+            self.dataset = self.dataset.select(selected_indices)
+
         if limit is not None:
             self.dataset = self.dataset.select(range(min(limit, len(self.dataset))))
 

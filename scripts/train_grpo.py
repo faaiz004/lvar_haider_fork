@@ -57,6 +57,9 @@ def main() -> None:
     config = load_config(args.config)
     train_cfg = config["train"]
     dataset_cfg = config["dataset"]
+    dataset_partition = train_cfg.get("dataset_partition", dataset_cfg.get("train_partition", "train"))
+    split_seed = int(train_cfg.get("split_seed", dataset_cfg.get("split_seed", train_cfg.get("seed", 42))))
+    test_fraction = float(train_cfg.get("test_fraction", dataset_cfg.get("test_fraction", 0.1)))
 
     # Build reproducible runtime and model/optimizer objects.
     set_seed(int(train_cfg.get("seed", 42)))
@@ -74,6 +77,9 @@ def main() -> None:
         split=dataset_cfg.get("split", "train"),
         limit=train_cfg.get("max_examples", dataset_cfg.get("limit")),
         dataset_name=dataset_cfg.get("name", "MMInstruction/Clevr_CoGenT_TrainA_70K_Complex"),
+        partition=dataset_partition,
+        test_fraction=test_fraction,
+        split_seed=split_seed,
     )
 
     output_dir = Path(train_cfg.get("output_dir", "outputs/train"))
