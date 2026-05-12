@@ -1,7 +1,7 @@
 import unittest
 from unittest.mock import patch
 
-from lvar.dataset import CLEVRCoGenTDataset, M3CoTDataset, build_dataset
+from lvar.dataset import CLEVRCoGenTDataset, M3CoTDataset, ScienceQADataset, build_dataset
 from lvar.rewards import normalize_answer
 
 
@@ -17,6 +17,9 @@ class FakeHFDataset:
 
     def select(self, indices):
         return FakeHFDataset([self.rows[index] for index in indices])
+
+    def filter(self, predicate):
+        return FakeHFDataset([row for row in self.rows if predicate(row)])
 
 
 class DatasetTests(unittest.TestCase):
@@ -86,6 +89,57 @@ class DatasetTests(unittest.TestCase):
         build_dataset({"type": "m3cot", "name": "LightChen2333/M3CoT", "split": "train"}, partition="test")
 
         mock_load_dataset.assert_called_once_with("LightChen2333/M3CoT", split="test")
+
+    @patch("lvar.dataset.load_dataset")
+    def test_scienceqa_dataset_mapping_filters_missing_images(self, mock_load_dataset):
+        rows = [
+            {
+                "image": None,
+                "question": "Text-only question?",
+                "choices": ["yes", "no"],
+                "answer": 0,
+                "hint": "",
+                "solution": "",
+            },
+            {
+                "image": "fake-image",
+                "question": "Which state is farthest north?",
+                "choices": ["West Virginia", "Louisiana", "Arizona", "Oklahoma"],
+                "answer": 0,
+                "hint": "Use the compass rose.",
+                "task": "closed choice",
+                "grade": "grade2",
+                "subject": "social science",
+                "topic": "geography",
+                "category": "Geography",
+                "skill": "Read a map: cardinal directions",
+                "solution": "West Virginia is farthest north.",
+            },
+        ]
+        mock_load_dataset.return_value = FakeHFDataset(rows)
+
+        dataset = ScienceQADataset(limit=1)
+        example = dataset[0]
+
+        self.assertEqual(len(dataset), 1)
+        self.assertEqual(example["image"], "fake-image")
+        self.assertIn("Hint: Use the compass rose.", example["question"])
+        self.assertIn("A. West Virginia", example["question"])
+        self.assertIn("D. Oklahoma", example["question"])
+        self.assertEqual(example["solution"], "West Virginia is farthest north.\n<answer>A</answer>")
+        self.assertEqual(example["gold_answer"], "a")
+        self.assertEqual(example["answer_index"], 0)
+
+    @patch("lvar.dataset.load_dataset")
+    def test_build_dataset_uses_scienceqa_partition_as_split(self, mock_load_dataset):
+        mock_load_dataset.return_value = FakeHFDataset([])
+
+        build_dataset(
+            {"type": "scienceqa", "name": "derek-thomas/ScienceQA", "split": "train"},
+            partition="validation",
+        )
+
+        mock_load_dataset.assert_called_once_with("derek-thomas/ScienceQA", split="validation")
 
     @patch("lvar.dataset.load_dataset")
     def test_train_test_partitions_are_deterministic_and_disjoint(self, mock_load_dataset):

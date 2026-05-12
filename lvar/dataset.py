@@ -143,6 +143,76 @@ class M3CoTDataset(Dataset):
         }
 
 
+class ScienceQADataset(Dataset):
+    """Dataset wrapper that exposes ScienceQA rows in the LVAR-ready format."""
+
+    def __init__(
+        self,
+        split: str = "train",
+        limit: Optional[int] = None,
+        dataset_name: str = "derek-thomas/ScienceQA",
+        require_image: bool = True,
+    ) -> None:
+        if load_dataset is None:
+            raise ImportError("datasets is required to load derek-thomas/ScienceQA. Install the requirements first.")
+        self.dataset = load_dataset(dataset_name, split=split)
+        if require_image:
+            self.dataset = self.dataset.filter(lambda row: row.get("image") is not None)
+        if limit is not None:
+            self.dataset = self.dataset.select(range(min(limit, len(self.dataset))))
+
+    def __len__(self) -> int:
+        """Return number of examples available after optional filtering/truncation."""
+        return len(self.dataset)
+
+    def __getitem__(self, index: int) -> Dict[str, Any]:
+        """
+        Return one ScienceQA example using the shared LVAR example contract.
+
+        ScienceQA stores the answer as a choice index. We render choices with
+        letter labels and evaluate against the corresponding normalized letter.
+        """
+        row = self.dataset[index]
+        choices = list(row.get("choices") or [])
+        answer_index = int(row["answer"])
+        answer_label = chr(ord("A") + answer_index)
+        question_parts = []
+        hint = str(row.get("hint") or "").strip()
+        if hint:
+            question_parts.append(f"Hint: {hint}")
+        question_parts.append(str(row["question"]).strip())
+        if choices:
+            rendered_choices = []
+            for choice_index, choice in enumerate(choices):
+                label = chr(ord("A") + choice_index)
+                rendered_choices.append(f"{label}. {choice}")
+            question_parts.append("Choices:\n" + "\n".join(rendered_choices))
+        question_parts.append("Answer with the letter of the correct choice.")
+
+        solution_text = str(row.get("solution") or "").strip()
+        solution = (
+            f"{solution_text}\n<answer>{answer_label}</answer>"
+            if solution_text
+            else f"<answer>{answer_label}</answer>"
+        )
+        return {
+            "id": row.get("id", index),
+            "image": row["image"],
+            "question": "\n".join(question_parts),
+            "solution": solution,
+            "gold_answer": normalize_answer_text(answer_label),
+            "choices": choices,
+            "answer_index": answer_index,
+            "hint": row.get("hint"),
+            "task": row.get("task"),
+            "grade": row.get("grade"),
+            "subject": row.get("subject"),
+            "topic": row.get("topic"),
+            "category": row.get("category"),
+            "skill": row.get("skill"),
+        }
+
+
 def build_dataset(dataset_cfg: Dict[str, Any], limit: Optional[int] = None, partition: Optional[str] = None) -> Dataset:
     """Instantiate the configured dataset behind a shared script-facing API."""
     dataset_type = str(dataset_cfg.get("type", "clevr")).strip().lower()
@@ -162,5 +232,13 @@ def build_dataset(dataset_cfg: Dict[str, Any], limit: Optional[int] = None, part
             split=split,
             limit=dataset_limit,
             dataset_name=dataset_cfg.get("name", "LightChen2333/M3CoT"),
+        )
+    if dataset_type in {"scienceqa", "science-qa"}:
+        split = partition if partition in {"train", "validation", "test"} else dataset_cfg.get("split", "train")
+        return ScienceQADataset(
+            split=split,
+            limit=dataset_limit,
+            dataset_name=dataset_cfg.get("name", "derek-thomas/ScienceQA"),
+            require_image=bool(dataset_cfg.get("require_image", True)),
         )
     raise ValueError(f"Unsupported dataset type: {dataset_type}")

@@ -1,12 +1,13 @@
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 
 import yaml
 from tqdm import tqdm
 
-# Allow running as a script: `python scripts/infer_clevr.py ...`.
+# Allow running as a script: `python scripts/infer_pooling.py ...`.
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
@@ -30,11 +31,74 @@ def write_jsonl(path: Path, rows):
             handle.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
+def write_json(path: Path, data):
+    """Persist a JSON object with stable indentation for readability."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(data, handle, ensure_ascii=False, indent=2)
+        handle.write("\n")
+
+
+def _slugify(text: str) -> str:
+    """Convert dataset identifiers into filename-safe lowercase tokens."""
+    lowered = text.strip().lower()
+    cleaned = re.sub(r"[^a-z0-9]+", "_", lowered)
+    return cleaned.strip("_")
+
+
+def build_dataset_tag(dataset_cfg) -> str:
+    """Build a compact dataset tag used to disambiguate output artifact names."""
+    dataset_type = str(dataset_cfg.get("type", "dataset"))
+    dataset_name = str(dataset_cfg.get("name", "dataset"))
+    tail_name = dataset_name.rsplit("/", 1)[-1]
+    tail_tag = _slugify(tail_name)
+    type_tag = _slugify(dataset_type)
+    if tail_tag and tail_tag != "dataset":
+        return tail_tag
+    return type_tag or "dataset"
+
+
+def resolve_output_path(cli_output: str, inference_cfg, dataset_cfg) -> Path:
+    """Choose output path and inject dataset tag into filename when needed."""
+    dataset_tag = build_dataset_tag(dataset_cfg)
+    if cli_output:
+        return Path(cli_output)
+
+    configured_output = Path(inference_cfg.get("output_path", "outputs/predictions.jsonl"))
+    if dataset_tag in configured_output.stem:
+        return configured_output
+    return configured_output.with_name(f"{configured_output.stem}_{dataset_tag}{configured_output.suffix}")
+
+
+def build_accuracy_summary(totals, count: int, dataset_cfg, partition: str):
+    """Build a serializable summary payload for metrics sidecar artifacts."""
+    def metric(correct_key: str):
+        correct = int(totals[correct_key])
+        return {
+            "correct": correct,
+            "total": int(count),
+            "accuracy": float(correct / count) if count else 0.0,
+        }
+
+    return {
+        "dataset_type": dataset_cfg.get("type"),
+        "dataset_name": dataset_cfg.get("name"),
+        "dataset_partition": partition,
+        "num_examples": int(count),
+        "metrics": {
+            "full_image": metric("full_image_correct"),
+            "mean_pooled": metric("mean_pooled_correct"),
+            "max_pooled": metric("max_pooled_correct"),
+            "region_mean_pooled": metric("region_mean_pooled_correct"),
+            "region_max_pooled": metric("region_max_pooled_correct"),
+        },
+    }
+
 def main() -> None:
-    """Run CLEVR inference comparing full-image, pooled-image, and region-token baselines."""
+    """Run inference comparing full-image, pooled-image, and region-token baselines."""
     # Allow script-level limit/output overrides while defaulting to config values.
     parser = argparse.ArgumentParser(
-        description="Compare CLEVR accuracy for full-image, pooled-image, and region-token inputs."
+        description="Compare accuracy for full-image, pooled-image, and region-token inputs."
     )
     parser.add_argument("--config", default="configs/qwen2vl_clevr.yaml")
     parser.add_argument("--limit", type=int, default=None)
@@ -106,9 +170,20 @@ def main() -> None:
         rows.append(row)
 
     # Write all rows once at the end for a clean single output artifact.
-    output_path = Path(args.output or inference_cfg.get("output_path", "outputs/clevr_predictions.jsonl"))
+    output_path = resolve_output_path(args.output, inference_cfg, dataset_cfg)
     write_jsonl(output_path, rows)
     print(f"Wrote {len(rows)} predictions to {output_path}")
+
+    summary = build_accuracy_summary(
+        totals,
+        count=len(rows),
+        dataset_cfg=dataset_cfg,
+        partition=dataset_partition,
+    )
+    summary_json_path = output_path.with_name(f"{output_path.stem}_summary.json")
+    write_json(summary_json_path, summary)
+    print(f"Wrote accuracy summary JSON to {summary_json_path}")
+
     if rows:
         count = len(rows)
         print("Accuracy summary:")

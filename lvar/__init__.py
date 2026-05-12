@@ -1,4 +1,4 @@
-from .dataset import CLEVRCoGenTDataset, M3CoTDataset, build_dataset
+from .dataset import CLEVRCoGenTDataset, M3CoTDataset, ScienceQADataset, build_dataset
 from .qwen_lvar import QwenLVAR
 from .rewards import (
     baseline_correctness_reward,
@@ -10,6 +10,7 @@ from .rewards import (
 __all__ = [
     "CLEVRCoGenTDataset",
     "M3CoTDataset",
+    "ScienceQADataset",
     "build_dataset",
     "QwenLVAR",
     "baseline_correctness_reward",
