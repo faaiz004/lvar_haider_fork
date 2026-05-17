@@ -14,6 +14,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from lvar.dataset import build_dataset
 from lvar.qwen_lvar import QwenLVAR
 from lvar.rewards import correctness_reward
+from lvar.utils import add_model_loading_args, apply_model_loading_overrides
 
 try:
     from accelerate import Accelerator
@@ -55,12 +56,14 @@ def main() -> None:
     # Parse minimal CLI and validate optional dependency required by this script.
     parser = argparse.ArgumentParser(description="Train the LVAR controller with custom GRPO-style updates.")
     parser.add_argument("--config", default="configs/qwen2vl_clevr.yaml")
+    add_model_loading_args(parser)
     args = parser.parse_args()
 
     if Accelerator is None:
         raise ImportError("accelerate is required for train_grpo.py. Install the requirements first.")
 
     config = load_config(args.config)
+    config["model"] = apply_model_loading_overrides(config["model"], args)
     train_cfg = config["train"]
     dataset_cfg = config["dataset"]
     dataset_partition = train_cfg.get("dataset_partition", dataset_cfg.get("train_partition", "train"))

@@ -184,6 +184,29 @@ class QwenLVARTests(unittest.TestCase):
             )
         )
 
+    def test_checkpoint_cleanup_strips_ddp_and_ivtlr_prefixes(self):
+        state_dict = {
+            "module.base_causallm.model.layers.0.self_attn.q_proj.lora_A.default.weight": torch.ones(1),
+            "base_causallm.model.layers.0.self_attn.k_proj.lora_A.default.weight": torch.ones(1),
+            "model.layers.0.self_attn.v_proj.lora_A.default.weight": torch.ones(1),
+        }
+
+        cleaned = self.model._clean_checkpoint_state_dict(state_dict)
+
+        self.assertIn("model.layers.0.self_attn.q_proj.lora_A.default.weight", cleaned)
+        self.assertIn("model.layers.0.self_attn.k_proj.lora_A.default.weight", cleaned)
+        self.assertIn("model.layers.0.self_attn.v_proj.lora_A.default.weight", cleaned)
+
+    def test_checkpoint_loading_can_be_disabled_with_path_present(self):
+        model = build_model(checkpoint_path="/tmp/unused.pt", use_checkpoint=False)
+
+        self.assertFalse(model.use_checkpoint)
+        self.assertEqual(model.checkpoint_path, "/tmp/unused.pt")
+
+    def test_checkpoint_loading_requires_path_when_enabled(self):
+        with self.assertRaisesRegex(ValueError, "no checkpoint_path"):
+            build_model(use_checkpoint=True)
+
     def test_build_visual_bank_shapes(self):
         self.assertEqual(tuple(self.bank["patches"].shape), (4, 4))
         self.assertEqual(tuple(self.bank["regions"].shape), (4, 4))
@@ -279,6 +302,32 @@ class QwenLVARTests(unittest.TestCase):
         self.assertLess(cold_trace["action_probs"][1], hot_trace["action_probs"][1])
         self.assertEqual(cold_trace["controller_temperature"], 0.5)
         self.assertEqual(hot_trace["controller_temperature"], 2.0)
+
+    def test_training_forward_decodes_detached_state_without_grad(self):
+        captured = {}
+
+        def fake_decode(state, labels=None):
+            del labels
+            captured["requires_grad"] = state["inputs_embeds"].requires_grad
+            captured["grad_enabled"] = torch.is_grad_enabled()
+            return {
+                "answer": "yes",
+                "generated_text": "<answer>yes</answer>",
+                "generated_ids": [1],
+                "decode_prefix_length": state["inputs_embeds"].size(1),
+                "final_sequence_length": state["inputs_embeds"].size(1),
+            }
+
+        self.model.train()
+        self.model.max_steps = 1
+        self._set_controller_action(ACTION_GLOBAL)
+        self.model.decode_answer = fake_decode
+
+        output = self.model.forward("image", "question", sample_actions=True)
+
+        self.assertEqual(output["answer"], "yes")
+        self.assertFalse(captured["requires_grad"])
+        self.assertFalse(captured["grad_enabled"])
 
     def test_legacy_control_tokens_still_drop_act_token(self):
         model = build_model(use_control_tokens=True, think_append_hidden=False)

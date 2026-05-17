@@ -1,4 +1,5 @@
 import re
+import argparse
 from typing import Dict, Iterable, List, Optional
 
 # Discrete action ids used by the controller and trace utilities.
@@ -84,3 +85,38 @@ def format_trace_step(step_trace: Dict[str, object]) -> str:
 def format_trace(trace: Iterable[Dict[str, object]]) -> str:
     """Render an entire action trace as multi-line text for CLI debugging."""
     return "\n".join(format_trace_step(step) for step in trace)
+
+
+def add_model_loading_args(parser: argparse.ArgumentParser) -> None:
+    """Add common CLI overrides for Qwen/LVAR checkpoint loading."""
+    parser.add_argument(
+        "--use-checkpoint",
+        dest="use_checkpoint",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Override model.use_checkpoint from the config.",
+    )
+    parser.add_argument(
+        "--checkpoint-path",
+        default=None,
+        help="Override model.checkpoint_path from the config.",
+    )
+    parser.add_argument(
+        "--merge-lora",
+        dest="merge_lora",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Override model.merge_lora from the config.",
+    )
+
+
+def apply_model_loading_overrides(model_cfg: Dict[str, object], args: argparse.Namespace) -> Dict[str, object]:
+    """Apply optional CLI model-loading overrides to a model config copy."""
+    updated_cfg = dict(model_cfg)
+    if args.use_checkpoint is not None:
+        updated_cfg["use_checkpoint"] = args.use_checkpoint
+    if args.checkpoint_path is not None:
+        updated_cfg["checkpoint_path"] = args.checkpoint_path
+    if args.merge_lora is not None:
+        updated_cfg["merge_lora"] = args.merge_lora
+    return updated_cfg

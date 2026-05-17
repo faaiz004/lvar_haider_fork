@@ -16,10 +16,17 @@ from lvar.utils import (
 )
 
 try:
-    from transformers import AutoProcessor, Qwen2VLForConditionalGeneration
+    from transformers import AutoProcessor, AutoTokenizer, Qwen2VLForConditionalGeneration
 except ImportError:  # pragma: no cover - exercised in environments without HF deps
     AutoProcessor = None
+    AutoTokenizer = None
     Qwen2VLForConditionalGeneration = None
+
+try:
+    from peft import LoraConfig, get_peft_model
+except ImportError:  # pragma: no cover - exercised in environments without PEFT
+    LoraConfig = None
+    get_peft_model = None
 
 
 class ControllerHead(nn.Module):
@@ -125,9 +132,13 @@ class QwenLVAR(nn.Module):
         self.pooling = self._resolve_pooling(cfg.get("pooling", "mean"))
         self.use_control_tokens = bool(cfg.get("use_control_tokens", False))
         self.think_append_hidden = bool(cfg.get("think_append_hidden", True))
+        self.checkpoint_path = cfg.get("checkpoint_path") or cfg.get("ivtlr_checkpoint_path")
+        self.use_checkpoint = bool(cfg.get("use_checkpoint", bool(self.checkpoint_path)))
 
         if self.controller_temperature <= 0.0:
             raise ValueError("controller_temperature must be greater than 0.")
+        if self.use_checkpoint and not self.checkpoint_path:
+            raise ValueError("use_checkpoint is true but no checkpoint_path was provided.")
 
         # Load real HF components unless tests inject a stub backbone/processor pair.
         if backbone is None:
@@ -135,15 +146,12 @@ class QwenLVAR(nn.Module):
                 raise ImportError(
                     "transformers is required to instantiate the real Qwen2-VL backbone. "
                     "Install the requirements first."
-                )
-            backbone_kwargs: Dict[str, Any] = {}
-            if self.device.type == "cuda":
-                backbone_kwargs["torch_dtype"] = self.dtype
-            self.backbone = Qwen2VLForConditionalGeneration.from_pretrained(
-                self.model_id,
-                **backbone_kwargs,
             )
-            self.processor = AutoProcessor.from_pretrained(self.model_id)
+            self.processor = self._load_processor()
+            self.backbone = self._load_backbone()
+            self._maybe_resize_token_embeddings()
+            self._maybe_apply_lora()
+            self._maybe_load_backbone_checkpoint()
         else:
             self.backbone = backbone
             self.processor = processor
@@ -185,6 +193,115 @@ class QwenLVAR(nn.Module):
         self._current_postmerge_grid: Optional[Tuple[int, int]] = None
         self._current_image_grid: Optional[Tuple[int, int]] = None
         self.to(self.device)
+
+    def _load_processor(self) -> Any:
+        """Load processor/tokenizer and register latent special tokens if requested."""
+        processor = AutoProcessor.from_pretrained(self.model_id)
+        if not bool(self.cfg.get("add_latent_special_tokens", self.use_checkpoint)):
+            return processor
+        if AutoTokenizer is None:
+            raise ImportError("transformers AutoTokenizer is required to add latent special tokens.")
+        tokenizer = AutoTokenizer.from_pretrained(
+            self.model_id,
+            use_fast=False,
+            trust_remote_code=True,
+            padding_side="right",
+        )
+        tokenizer.add_special_tokens(
+            {
+                "additional_special_tokens": [
+                    "<|start-latent|>",
+                    "<|end-latent|>",
+                    "<|latent|>",
+                ]
+            }
+        )
+        processor.tokenizer = tokenizer
+        return processor
+
+    def _load_backbone(self) -> nn.Module:
+        """Load the Qwen2-VL backbone with config-compatible HF kwargs."""
+        backbone_kwargs: Dict[str, Any] = {
+            "trust_remote_code": bool(self.cfg.get("trust_remote_code", True)),
+        }
+        attn_implementation = self.cfg.get("attn_implementation")
+        if attn_implementation is not None:
+            backbone_kwargs["attn_implementation"] = attn_implementation
+        if self.device.type == "cuda":
+            backbone_kwargs["torch_dtype"] = self.dtype
+            if bool(self.cfg.get("device_map_cuda", False)):
+                backbone_kwargs["device_map"] = "cuda"
+        return Qwen2VLForConditionalGeneration.from_pretrained(
+            self.model_id,
+            **backbone_kwargs,
+        )
+
+    def _maybe_apply_lora(self) -> None:
+        """Wrap the backbone with LoRA adapters when loading an IVTLR/PEFT checkpoint."""
+        lora_cfg = self.cfg.get("lora", {})
+        use_lora = bool(lora_cfg.get("enabled", self.use_checkpoint))
+        if not use_lora:
+            return
+        if LoraConfig is None or get_peft_model is None:
+            raise ImportError("peft is required to load LoRA/IVTLR checkpoints. Install peft first.")
+        config = LoraConfig(
+            task_type=lora_cfg.get("task_type", "CAUSAL_LM"),
+            target_modules=lora_cfg.get(
+                "target_modules",
+                [
+                    "q_proj",
+                    "k_proj",
+                    "v_proj",
+                    "o_proj",
+                    "gate_proj",
+                    "up_proj",
+                    "down_proj",
+                ],
+            ),
+            r=int(lora_cfg.get("r", 64)),
+            lora_alpha=int(lora_cfg.get("lora_alpha", lora_cfg.get("alpha", 16))),
+            lora_dropout=float(lora_cfg.get("lora_dropout", lora_cfg.get("dropout", 0.05))),
+            bias=lora_cfg.get("bias", "none"),
+            inference_mode=bool(lora_cfg.get("inference_mode", False)),
+        )
+        self.backbone = get_peft_model(self.backbone, config)
+
+    def _maybe_resize_token_embeddings(self) -> None:
+        """Resize embeddings after special tokens are attached to the processor tokenizer."""
+        tokenizer = getattr(self.processor, "tokenizer", None)
+        if tokenizer is None or not hasattr(self.backbone, "resize_token_embeddings"):
+            return
+        self.backbone.resize_token_embeddings(len(tokenizer))
+
+    def _clean_checkpoint_state_dict(self, state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        """Remove wrappers used by DDP/IVTLR so keys match the PEFT-wrapped backbone."""
+        clean_state_dict = {}
+        for key, value in state_dict.items():
+            new_key = key
+            for prefix in ("module.", "base_causallm."):
+                if new_key.startswith(prefix):
+                    new_key = new_key[len(prefix) :]
+            clean_state_dict[new_key] = value
+        return clean_state_dict
+
+    def _maybe_load_backbone_checkpoint(self) -> None:
+        """Load an IVTLR/PEFT checkpoint into the backbone before LVAR modules are added."""
+        if not self.use_checkpoint:
+            return
+        state_dict = torch.load(self.checkpoint_path, map_location="cpu")
+        if isinstance(state_dict, dict) and "state_dict" in state_dict:
+            state_dict = state_dict["state_dict"]
+        clean_state_dict = self._clean_checkpoint_state_dict(state_dict)
+        missing, unexpected = self.backbone.load_state_dict(clean_state_dict, strict=False)
+        print(f"Loaded backbone checkpoint: {self.checkpoint_path}")
+        print("Missing backbone keys:", len(missing))
+        print("Unexpected backbone keys:", len(unexpected))
+        print("First missing backbone keys:", missing[:20])
+        print("First unexpected backbone keys:", unexpected[:20])
+        if bool(self.cfg.get("merge_lora", False)):
+            if not hasattr(self.backbone, "merge_and_unload"):
+                raise ValueError("merge_lora is true, but the backbone is not a mergeable PEFT model.")
+            self.backbone = self.backbone.merge_and_unload()
 
     def train(self, mode: bool = True) -> "QwenLVAR":
         """
@@ -846,6 +963,20 @@ class QwenLVAR(nn.Module):
             "final_attention_mask": current_mask,
         }
 
+    def _build_decode_state(self, state: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Return a detached decode-only view of recurrent state.
+
+        Training rewards only need decoded text, so final generation should not
+        retain a full autoregressive graph through the frozen backbone.
+        """
+        return {
+            "inputs_embeds": state["inputs_embeds"].detach(),
+            "attention_mask": state["attention_mask"].detach(),
+            "latent_pos": state.get("latent_pos"),
+            "act_pos": state.get("act_pos"),
+        }
+
     def forward(
         self,
         images: Any,
@@ -882,7 +1013,8 @@ class QwenLVAR(nn.Module):
         # Final decode excludes act token only in the legacy control-token path.
         if self.use_control_tokens:
             state = self.drop_act_token(state)
-        decoded = self.decode_answer(state, labels=labels)
+        with torch.no_grad():
+            decoded = self.decode_answer(self._build_decode_state(state), labels=labels)
         action_log_prob_sum = None
         if state["action_log_probs"]:
             action_log_prob_sum = torch.stack(state["action_log_probs"]).sum()

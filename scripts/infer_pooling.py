@@ -15,6 +15,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from lvar.dataset import build_dataset
 from lvar.qwen_lvar import QwenLVAR
 from lvar.rewards import correctness_reward
+from lvar.utils import add_model_loading_args, apply_model_loading_overrides
 
 
 def load_config(config_path: str):
@@ -103,9 +104,11 @@ def main() -> None:
     parser.add_argument("--config", default="configs/qwen2vl_clevr.yaml")
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--output", default=None)
+    add_model_loading_args(parser)
     args = parser.parse_args()
 
     config = load_config(args.config)
+    config["model"] = apply_model_loading_overrides(config["model"], args)
     dataset_cfg = config["dataset"]
     inference_cfg = config.get("inference", {})
     train_cfg = config.get("train", {})

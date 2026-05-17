@@ -1,5 +1,6 @@
 torch
 transformers
+peft
 datasets[vision]
 accelerate
 pillow

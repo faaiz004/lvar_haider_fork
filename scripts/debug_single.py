@@ -13,7 +13,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from lvar.dataset import build_dataset
 from lvar.qwen_lvar import QwenLVAR
-from lvar.utils import format_trace_step
+from lvar.utils import add_model_loading_args, apply_model_loading_overrides, format_trace_step
 
 
 def load_config(config_path: str):
@@ -28,9 +28,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Run a single LVAR debug example.")
     parser.add_argument("--config", default="configs/qwen2vl_clevr.yaml")
     parser.add_argument("--index", type=int, default=None)
+    add_model_loading_args(parser)
     args = parser.parse_args()
 
     config = load_config(args.config)
+    config["model"] = apply_model_loading_overrides(config["model"], args)
     dataset_cfg = config["dataset"]
 
     # Build dataset and model exactly like main inference path so debug reflects real behavior.
