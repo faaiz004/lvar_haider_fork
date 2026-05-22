@@ -197,6 +197,44 @@ class QwenLVARTests(unittest.TestCase):
         self.assertIn("model.layers.0.self_attn.k_proj.lora_A.default.weight", cleaned)
         self.assertIn("model.layers.0.self_attn.v_proj.lora_A.default.weight", cleaned)
 
+    def test_checkpoint_alignment_matches_qwen_peft_wrapper_depth(self):
+        state_dict = {
+            "base_model.model.visual.patch_embed.proj.weight": torch.ones(1),
+            "base_model.model.model.layers.0.self_attn.q_proj.lora_A.default.weight": torch.ones(1),
+            "embedding.weight": torch.ones(1),
+        }
+        target_state_dict = {
+            "base_model.model.model.visual.patch_embed.proj.weight": torch.zeros(1),
+            "base_model.model.model.layers.0.self_attn.q_proj.lora_A.default.weight": torch.zeros(1),
+        }
+
+        aligned = self.model._align_checkpoint_state_dict(state_dict, target_state_dict)
+
+        self.assertIn("base_model.model.model.visual.patch_embed.proj.weight", aligned)
+        self.assertIn("base_model.model.model.layers.0.self_attn.q_proj.lora_A.default.weight", aligned)
+        self.assertIn("embedding.weight", aligned)
+
+    def test_checkpoint_alignment_matches_qwen_language_model_submodule(self):
+        state_dict = {
+            "base_model.model.model.embed_tokens.weight": torch.ones(1),
+            "base_model.model.model.layers.0.self_attn.q_proj.base_layer.weight": torch.ones(1),
+            "base_model.model.model.norm.weight": torch.ones(1),
+            "base_model.model.model.visual.patch_embed.proj.weight": torch.ones(1),
+        }
+        target_state_dict = {
+            "base_model.model.model.language_model.embed_tokens.weight": torch.zeros(1),
+            "base_model.model.model.language_model.layers.0.self_attn.q_proj.base_layer.weight": torch.zeros(1),
+            "base_model.model.model.language_model.norm.weight": torch.zeros(1),
+            "base_model.model.model.visual.patch_embed.proj.weight": torch.zeros(1),
+        }
+
+        aligned = self.model._align_checkpoint_state_dict(state_dict, target_state_dict)
+
+        self.assertIn("base_model.model.model.language_model.embed_tokens.weight", aligned)
+        self.assertIn("base_model.model.model.language_model.layers.0.self_attn.q_proj.base_layer.weight", aligned)
+        self.assertIn("base_model.model.model.language_model.norm.weight", aligned)
+        self.assertIn("base_model.model.model.visual.patch_embed.proj.weight", aligned)
+
     def test_checkpoint_loading_can_be_disabled_with_path_present(self):
         model = build_model(checkpoint_path="/tmp/unused.pt", use_checkpoint=False)
 

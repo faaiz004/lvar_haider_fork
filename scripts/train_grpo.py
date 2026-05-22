@@ -50,12 +50,50 @@ def normalize_group_rewards(rewards: torch.Tensor) -> torch.Tensor:
         return rewards - rewards.mean()
     return (rewards - rewards.mean()) / (std + 1e-8)
 
+def asymmetric_baseline_weight(
+        baseline_score: float,
+        rollout_score: float,
+        improve_weight: float = 1.5,
+        miss_weight: float = 1.0,
+        already_correct_weight: float = 0.5,
+        regression_weight: float = 1.5,
+    ) -> float:
+        baseline_correct = baseline_score > 0.5
+        rollout_correct = rollout_score > 0.5
+
+        if not baseline_correct and rollout_correct:
+            return improve_weight
+
+        if not baseline_correct and not rollout_correct:
+            return miss_weight
+
+        if baseline_correct and rollout_correct:
+            return already_correct_weight
+
+        # baseline correct, rollout wrong
+        return regression_weight
+
+
+def trainable_state_dict(model: torch.nn.Module) -> dict:
+    """Return only trainable LVAR/controller-facing parameters, excluding frozen backbone weights."""
+    return {
+        name: parameter.detach().cpu()
+        for name, parameter in model.named_parameters()
+        if parameter.requires_grad
+    }
+
+
+def save_controller_checkpoint(model: torch.nn.Module, checkpoint_path: Path) -> None:
+    """Save a controller-only checkpoint to the requested path."""
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(trainable_state_dict(model), checkpoint_path)
+    print(f"Saved controller checkpoint to {checkpoint_path}")
+
 
 def main() -> None:
     """Train controller-facing LVAR parameters using custom grouped rollouts."""
-    # Parse minimal CLI and validate optional dependency required by this script.
     parser = argparse.ArgumentParser(description="Train the LVAR controller with custom GRPO-style updates.")
-    parser.add_argument("--config", default="configs/qwen2vl_clevr.yaml")
+    parser.add_argument("--config", default="configs/qwen2vl_m3cot.yaml")
     add_model_loading_args(parser)
     args = parser.parse_args()
 
@@ -70,7 +108,6 @@ def main() -> None:
     split_seed = int(train_cfg.get("split_seed", dataset_cfg.get("split_seed", train_cfg.get("seed", 42))))
     test_fraction = float(train_cfg.get("test_fraction", dataset_cfg.get("test_fraction", 0.1)))
 
-    # Build reproducible runtime and model/optimizer objects.
     set_seed(int(train_cfg.get("seed", 42)))
     accelerator = Accelerator()
     model = QwenLVAR(config["model"]).to(accelerator.device)
@@ -100,52 +137,128 @@ def main() -> None:
     log_every = int(train_cfg.get("log_every", 10))
 
     global_step = 0
+
     for epoch in range(num_epochs):
         for example in dataset:
-            # Sample grouped LVAR trajectories for the same prompt.
+            # ------------------------------------------------------------
+            # 1. Compute no-latent baseline correctness once for this prompt.
+            # ------------------------------------------------------------
+            with torch.no_grad():
+                baseline_output = model.baseline_forward(
+                    example["image"],
+                    example["question"],
+                )
+                baseline_score = correctness_reward(
+                    baseline_output["answer"],
+                    example["gold_answer"],
+                )
+
+            # Convert to a scalar Python float for prompt-level weighting.
+            baseline_score_float = float(baseline_score)
+
+            # ------------------------------------------------------------
+            # 2. Sample grouped LVAR trajectories for the same prompt.
+            # ------------------------------------------------------------
             rollout_outputs = []
             rewards = []
-            for _ in range(group_size):
-                rollout = model.forward(example["image"], example["question"], sample_actions=True)
-                rollout_outputs.append(rollout)
-                rewards.append(correctness_reward(rollout["answer"], example["gold_answer"]))
 
-            # Convert raw rollout rewards into normalized per-group advantages.
-            reward_tensor = torch.tensor(rewards, device=accelerator.device, dtype=torch.float32)
+            for _ in range(group_size):
+                rollout = model.forward(
+                    example["image"],
+                    example["question"],
+                    sample_actions=True,
+                )
+                rollout_outputs.append(rollout)
+
+                rollout_score = correctness_reward(
+                    rollout["answer"],
+                    example["gold_answer"],
+                )
+                rewards.append(float(rollout_score))
+
+            # ------------------------------------------------------------
+            # 3. Convert rewards into group-normalized advantages.
+            #    Do NOT subtract baseline here because it cancels under
+            #    per-prompt group normalization.
+            # ------------------------------------------------------------
+            reward_tensor = torch.tensor(
+                rewards,
+                device=accelerator.device,
+                dtype=torch.float32,
+            )
+
             advantages = normalize_group_rewards(reward_tensor)
 
-            # Policy gradient objective over action log-prob sums from each trajectory.
+            # Apply no-latent baseline as prompt-level advantage weight.
+            # If baseline is wrong, amplify the preference signal.
+            # If baseline is correct, dampen the preference signal.
+            weights = torch.tensor([
+                    asymmetric_baseline_weight(
+                        baseline_score=baseline_score_float,
+                        rollout_score=float(r),
+                        improve_weight=float(train_cfg.get("improve_weight", 1.5)),
+                        miss_weight=float(train_cfg.get("miss_weight", 1.0)),
+                        already_correct_weight=float(train_cfg.get("already_correct_weight", 0.5)),
+                        regression_weight=float(train_cfg.get("regression_weight", 1.5)),
+                    )
+                    for r in rewards
+                ],
+                device=accelerator.device,
+                dtype=torch.float32,
+            )
+            advantages = advantages * weights
+
+            # ------------------------------------------------------------
+            # 4. Policy-gradient objective over sampled action log-probs.
+            # ------------------------------------------------------------
             loss_terms = []
             for advantage, rollout in zip(advantages, rollout_outputs):
-                if rollout["action_log_prob_sum"] is None:
+                action_log_prob_sum = rollout.get("action_log_prob_sum")
+                
+                if action_log_prob_sum is None:
                     continue
-                loss_terms.append(-advantage.detach() * rollout["action_log_prob_sum"])
+                
+                action_loss = action_log_prob_sum / max(1, len(rollout["action_log_probs"]))
+
+                # action_log_prob_sum must be a differentiable tensor
+                # produced by the controller during sampled rollout.
+                loss_terms.append(
+                    -advantage.detach() * action_loss
+                )
 
             if not loss_terms:
                 continue
 
-            # Standard optimizer step with gradient clipping for stability.
             loss = torch.stack(loss_terms).mean()
+
             optimizer.zero_grad(set_to_none=True)
             accelerator.backward(loss)
+
             torch.nn.utils.clip_grad_norm_(
                 [parameter for parameter in model.parameters() if parameter.requires_grad],
                 grad_clip_norm,
             )
+
             optimizer.step()
 
             global_step += 1
+
             if global_step % log_every == 0 and accelerator.is_local_main_process:
                 print(
                     f"epoch={epoch} step={global_step} "
-                    f"loss={float(loss.item()):.4f} reward_mean={float(reward_tensor.mean().item()):.4f}"
+                    f"loss={float(loss.item()):.4f} "
+                    f"reward_mean={float(reward_tensor.mean().item()):.4f} "
+                    f"reward_std={float(reward_tensor.std(unbiased=False).item()):.4f} "
+                    f"baseline_score={baseline_score_float:.1f} "
                 )
+        if accelerator.is_local_main_process:
+            epoch_checkpoint_path = output_dir / f"lvar_controller_epoch_{epoch + 1}.pt"
+            save_controller_checkpoint(model, epoch_checkpoint_path)
 
     # Save final weights from the main process only.
     if accelerator.is_local_main_process:
         checkpoint_path = output_dir / "lvar_controller.pt"
-        torch.save(model.state_dict(), checkpoint_path)
-        print(f"Saved checkpoint to {checkpoint_path}")
+        save_controller_checkpoint(model, checkpoint_path)
 
 
 if __name__ == "__main__":

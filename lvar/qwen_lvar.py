@@ -284,6 +284,34 @@ class QwenLVAR(nn.Module):
             clean_state_dict[new_key] = value
         return clean_state_dict
 
+    def _align_checkpoint_state_dict(
+        self,
+        state_dict: Dict[str, torch.Tensor],
+        target_state_dict: Dict[str, torch.Tensor],
+    ) -> Dict[str, torch.Tensor]:
+        """Align known Qwen/PEFT wrapper-depth differences against target keys."""
+        aligned_state_dict = {}
+        target_keys = set(target_state_dict)
+        for key, value in state_dict.items():
+            candidate_keys = [key]
+            if key.startswith("base_model.model."):
+                candidate_keys.append("base_model.model.model." + key[len("base_model.model.") :])
+            if key.startswith("model."):
+                candidate_keys.append("base_model.model.model." + key[len("model.") :])
+            for prefix in ("base_model.model.model.", "base_model.model."):
+                if key.startswith(prefix):
+                    suffix = key[len(prefix) :]
+                    if suffix.startswith(("embed_tokens.", "layers.", "norm.", "rotary_emb.")):
+                        candidate_keys.append(prefix + "language_model." + suffix)
+
+            aligned_key = key
+            for candidate_key in candidate_keys:
+                if candidate_key in target_keys:
+                    aligned_key = candidate_key
+                    break
+            aligned_state_dict[aligned_key] = value
+        return aligned_state_dict
+
     def _maybe_load_backbone_checkpoint(self) -> None:
         """Load an IVTLR/PEFT checkpoint into the backbone before LVAR modules are added."""
         if not self.use_checkpoint:
@@ -292,7 +320,8 @@ class QwenLVAR(nn.Module):
         if isinstance(state_dict, dict) and "state_dict" in state_dict:
             state_dict = state_dict["state_dict"]
         clean_state_dict = self._clean_checkpoint_state_dict(state_dict)
-        missing, unexpected = self.backbone.load_state_dict(clean_state_dict, strict=False)
+        aligned_state_dict = self._align_checkpoint_state_dict(clean_state_dict, self.backbone.state_dict())
+        missing, unexpected = self.backbone.load_state_dict(aligned_state_dict, strict=False)
         print(f"Loaded backbone checkpoint: {self.checkpoint_path}")
         print("Missing backbone keys:", len(missing))
         print("Unexpected backbone keys:", len(unexpected))
