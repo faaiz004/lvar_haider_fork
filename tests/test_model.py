@@ -16,6 +16,15 @@ from lvar.utils import (
 class DummyTokenizer:
     eos_token_id = 0
 
+    def __call__(self, text, return_tensors=None, add_special_tokens=False):
+        del return_tensors, add_special_tokens
+        token_ids = []
+        for piece in str(text).split():
+            token_ids.append((sum(ord(char) for char in piece) % 3) + 1)
+        if not token_ids:
+            token_ids = [1]
+        return {"input_ids": torch.tensor([token_ids], dtype=torch.long)}
+
     def decode(self, token_ids, skip_special_tokens=True):
         del skip_special_tokens
         pieces = []
@@ -33,8 +42,18 @@ class DummyProcessor:
     def __init__(self):
         self.tokenizer = DummyTokenizer()
 
-    def apply_chat_template(self, messages, add_generation_prompt, tokenize, return_dict, return_tensors):
-        del messages, add_generation_prompt, tokenize, return_dict, return_tensors
+    def apply_chat_template(self, messages, add_generation_prompt=True, tokenize=False):
+        del messages, add_generation_prompt
+        if tokenize:
+            return {
+                "input_ids": torch.tensor([[5, 999, 999, 999, 999, 6]], dtype=torch.long),
+                "attention_mask": torch.tensor([[1, 1, 1, 1, 1, 1]], dtype=torch.long),
+                "pixel_values": torch.tensor([[0.0]], dtype=torch.float32),
+                "image_grid_thw": torch.tensor([[1, 2, 2]], dtype=torch.long),
+            }
+        return "<dummy text>"
+
+    def __call__(self, text=None, images=None, return_tensors=None):
         return {
             "input_ids": torch.tensor([[5, 999, 999, 999, 999, 6]], dtype=torch.long),
             "attention_mask": torch.tensor([[1, 1, 1, 1, 1, 1]], dtype=torch.long),
@@ -70,8 +89,14 @@ class DummyVision(torch.nn.Module):
 
 
 class DummyMergedGridProcessor(DummyProcessor):
-    def apply_chat_template(self, messages, add_generation_prompt, tokenize, return_dict, return_tensors):
-        batch = super().apply_chat_template(messages, add_generation_prompt, tokenize, return_dict, return_tensors)
+    def apply_chat_template(self, messages, add_generation_prompt=True, tokenize=False):
+        batch = super().apply_chat_template(messages, add_generation_prompt, tokenize)
+        if isinstance(batch, dict):
+            batch["image_grid_thw"] = torch.tensor([[1, 4, 4]], dtype=torch.long)
+        return batch
+
+    def __call__(self, text=None, images=None, return_tensors=None):
+        batch = super().__call__(text=text, images=images, return_tensors=return_tensors)
         batch["image_grid_thw"] = torch.tensor([[1, 4, 4]], dtype=torch.long)
         return batch
 
@@ -124,6 +149,7 @@ def build_model(**overrides):
         "region_window": 1,
         "max_answer_tokens": 1,
         "action_selection": "argmax",
+        "controller_context_window": 1,
     }
     cfg.update(overrides)
     return QwenLVAR(cfg, backbone=DummyBackbone(), processor=DummyProcessor())
@@ -137,6 +163,7 @@ def build_merged_grid_model():
         "region_window": 1,
         "max_answer_tokens": 1,
         "action_selection": "argmax",
+        "controller_context_window": 1,
     }
     return QwenLVAR(
         cfg,
@@ -248,6 +275,7 @@ class QwenLVARTests(unittest.TestCase):
     def test_build_visual_bank_shapes(self):
         self.assertEqual(tuple(self.bank["patches"].shape), (4, 4))
         self.assertEqual(tuple(self.bank["regions"].shape), (4, 4))
+        self.assertEqual(tuple(self.bank["raw_regions"].shape), (4, 1, 4))
         self.assertEqual(tuple(self.bank["global"].shape), (1, 4))
         self.assertTrue(torch.allclose(self.bank["global"][0], torch.tensor([0.25, 0.25, 0.25, 0.25])))
 
@@ -269,6 +297,7 @@ class QwenLVARTests(unittest.TestCase):
 
         self.assertEqual(tuple(bank["patches"].shape), (15, 4))
         self.assertEqual(tuple(bank["regions"].shape), (6, 4))
+        self.assertEqual(tuple(bank["raw_regions"].shape), (6, 4, 4))
         self.assertEqual(tuple(bank["global"].shape), (1, 4))
 
     def test_default_initial_state_has_no_control_tokens(self):
@@ -276,6 +305,46 @@ class QwenLVARTests(unittest.TestCase):
         self.assertEqual(state["inputs_embeds"].size(1), self.prepared["input_ids"].size(1))
         self.assertIsNone(state["latent_pos"])
         self.assertIsNone(state["act_pos"])
+
+    def test_coarse_initial_state_replaces_image_span_with_global_token(self):
+        state = self.model.build_coarse_initial_state(self.prepared, self.bank)
+
+        self.assertEqual(state["inputs_embeds"].size(1), 3)
+        self.assertTrue(torch.allclose(state["inputs_embeds"][:, 1, :], self.bank["global"]))
+        self.assertIsNone(state["latent_pos"])
+        self.assertIsNone(state["act_pos"])
+
+    def test_apply_mined_actions_supports_multi_patch_and_think(self):
+        state = self.model.build_coarse_initial_state(self.prepared, self.bank)
+        initial_length = state["inputs_embeds"].size(1)
+
+        updated = self.model.apply_mined_actions(
+            state,
+            self.bank,
+            [
+                {"type": "PATCH", "patch_idx": 0},
+                {"type": "PATCH", "patch_idx": 1},
+                {"type": "THINK"},
+            ],
+        )
+
+        self.assertEqual(updated["inputs_embeds"].size(1), initial_length + 3)
+        self.assertTrue(torch.allclose(updated["inputs_embeds"][:, 1, :], self.bank["global"]))
+        self.assertTrue(torch.allclose(updated["inputs_embeds"][:, 2, :], self.bank["patches"][0].view(1, -1)))
+        self.assertTrue(torch.allclose(updated["inputs_embeds"][:, 3, :], self.bank["patches"][1].view(1, -1)))
+
+    def test_apply_mined_region_inserts_raw_region_tokens(self):
+        model = build_model(controller_context_window=1, region_window=2)
+        prepared = model.prepare_inputs("image", "question")
+        projected = model.get_projected_image_tokens(prepared)
+        prepared["projected_image_tokens"] = projected
+        bank = model.build_visual_bank(projected)
+        state = model.build_coarse_initial_state(prepared, bank)
+
+        updated = model.apply_mined_actions(state, bank, [{"type": "REGION", "region_idx": 0}])
+
+        self.assertEqual(updated["inputs_embeds"].size(1), 7)
+        self.assertTrue(torch.allclose(updated["inputs_embeds"][:, 2:6, :], bank["raw_regions"][0].unsqueeze(0)))
 
     def test_tokenless_controller_uses_last_hidden_state_and_step(self):
         state = self.model.build_initial_state(self.prepared)
@@ -435,6 +504,56 @@ class QwenLVARTests(unittest.TestCase):
         model.action_selection = "argmax"
         model.generate_lvar("image", "question")
         self.assertFalse(captured["sample_actions"])
+
+    def test_controller_reads_multiple_hidden_states(self):
+        model = build_model(controller_context_window=3)
+        prepared = model.prepare_inputs("image", "question")
+        projected = model.get_projected_image_tokens(prepared)
+        prepared["projected_image_tokens"] = projected
+        bank = model.build_visual_bank(projected)
+        state = model.build_initial_state(prepared)
+        capture = {}
+
+        def forward(state_hidden, step_hidden, bank, act_hidden=None):
+            capture["state_hidden"] = state_hidden.detach().clone()
+            capture["step_hidden"] = step_hidden.detach().clone()
+            type_logits = torch.full((1, 5), -10.0)
+            type_logits[0, ACTION_STOP] = 10.0
+            region_logits = torch.zeros(1, bank["regions"].size(0))
+            patch_logits = torch.zeros(1, bank["patches"].size(0))
+            return type_logits, region_logits, patch_logits
+
+        model.controller.forward = forward
+        model.forward_reasoning_step(state, bank, 0)
+
+        self.assertEqual(tuple(capture["state_hidden"].shape), (1, 12))
+
+    def test_region_inserts_raw_patches(self):
+        model = build_model(controller_context_window=1, region_window=2)
+        prepared = model.prepare_inputs("image", "question")
+        projected = model.get_projected_image_tokens(prepared)
+        prepared["projected_image_tokens"] = projected
+        bank = model.build_visual_bank(projected)
+        state = model.build_initial_state(prepared)
+        initial_length = state["inputs_embeds"].size(1)
+
+        def forward(state_hidden, step_hidden, bank, act_hidden=None):
+            type_logits = torch.full((1, 5), -10.0)
+            type_logits[0, ACTION_REGION] = 10.0
+            region_logits = torch.zeros(1, bank["regions"].size(0))
+            region_logits[0, 0] = 10.0
+            patch_logits = torch.zeros(1, bank["patches"].size(0))
+            return type_logits, region_logits, patch_logits
+
+        model.controller.forward = forward
+        updated_state, action_id, should_stop, step_trace = model.forward_reasoning_step(
+            state, bank, 0
+        )
+
+        self.assertEqual(action_id, ACTION_REGION)
+        self.assertEqual(step_trace["sequence_length_after"], initial_length + 4)
+        self.assertIn("raw_regions", bank)
+        self.assertEqual(tuple(bank["raw_regions"].shape), (1, 4, 4))
 
 
 if __name__ == "__main__":

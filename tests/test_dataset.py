@@ -75,12 +75,14 @@ class DatasetTests(unittest.TestCase):
 
         self.assertEqual(example["id"], "physical-commonsense-1422")
         self.assertEqual(example["image"], "fake-image")
-        self.assertIn("What feature does the flip phone", example["question"])
-        self.assertIn("A. It has a large touch screen display", example["question"])
-        self.assertIn("C. It is able to take pictures", example["question"])
+        self.assertIn("[Question]:{What feature does the flip phone", example["question"])
+        self.assertIn("(A).{It has a large touch screen display}", example["question"])
+        self.assertIn("(C).{It is able to take pictures}", example["question"])
+        self.assertTrue(example["question"].endswith("Answer:\n"))
+        self.assertEqual(example["steps"], ["The camera is visible."])
+        self.assertEqual(example["answer"], "C")
         self.assertEqual(example["solution"], "The camera is visible.\n<answer>C</answer>")
         self.assertEqual(example["gold_answer"], "c")
-        self.assertEqual(example["choices"], rows[0]["choices"])
 
     @patch("lvar.dataset.load_dataset")
     def test_build_dataset_uses_m3cot_partition_as_split(self, mock_load_dataset):

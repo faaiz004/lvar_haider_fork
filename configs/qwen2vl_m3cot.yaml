@@ -10,12 +10,24 @@ model:
   pooling: mean
   use_control_tokens: false
   think_append_hidden: true
+  controller_context_window: 3
 
 dataset:
   type: m3cot
   name: LightChen2333/M3CoT
   split: train
   limit:
+  require_image: true
+  max_latent_stage: 20
+
+phase2:
+  seed: 42
+  selection_delta: 0.03
+  patch_k_choices: [1, 2, 3, 4]
+  max_steps: 8
+  image_size: 280
+  output_path: outputs/phase2_m3cot_traces.jsonl
+  initial_visual_mode: global_mean
 
 train:
   seed: 42

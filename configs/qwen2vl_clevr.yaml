@@ -10,6 +10,7 @@ model:
   pooling: mean
   use_control_tokens: false
   think_append_hidden: true
+  controller_context_window: 3
 
 dataset:
   type: clevr

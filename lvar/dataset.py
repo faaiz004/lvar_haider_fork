@@ -3,6 +3,7 @@ from typing import Any, Dict, Optional
 
 from torch.utils.data import Dataset
 
+from lvar.oracle_mining import group_steps_to_max, split_rationale_into_sentences
 from lvar.utils import extract_tagged_answer, normalize_answer_text
 
 try:
@@ -93,14 +94,19 @@ class M3CoTDataset(Dataset):
         split: str = "train",
         limit: Optional[int] = None,
         dataset_name: str = "LightChen2333/M3CoT",
+        require_image: bool = True,
+        max_latent_stage: int = 8,
     ) -> None:
         if load_dataset is None:
             raise ImportError(
                 "datasets is required to load LightChen2333/M3CoT. Install the requirements first."
             )
         self.dataset = load_dataset(dataset_name, split=split)
+        if require_image:
+            self.dataset = self.dataset.filter(lambda row: row.get("image") is not None)
         if limit is not None:
             self.dataset = self.dataset.select(range(min(limit, len(self.dataset))))
+        self.max_latent_stage = int(max_latent_stage)
 
     def __len__(self) -> int:
         """Return number of examples available after optional truncation."""
@@ -115,31 +121,29 @@ class M3CoTDataset(Dataset):
         """
         row = self.dataset[index]
         choices = list(row.get("choices") or [])
-        question_parts = []
-        context = str(row.get("context") or "").strip()
-        if context:
-            question_parts.append(f"Context: {context}")
-        question_parts.append(str(row["question"]).strip())
-        if choices:
-            rendered_choices = []
-            for choice_index, choice in enumerate(choices):
-                label = chr(ord("A") + choice_index)
-                rendered_choices.append(f"{label}. {choice}")
-            question_parts.append("Choices:\n" + "\n".join(rendered_choices))
-        question_parts.append("Answer with the letter of the correct choice.")
-
+        choices_str = "[Options]:\n" + "\n".join(
+            [
+                f"({chr(65 + choice_index)}).{{{str(choice).strip()}}}"
+                for choice_index, choice in enumerate(choices)
+            ]
+        )
+        question_with_braces = f"{{{str(row['question']).strip()}}}"
+        formatted_question = f"[Question]:{question_with_braces}\n{choices_str}\nAnswer:\n"
         answer = str(row["answer"]).strip()
         rationale = str(row.get("rationale") or "").strip()
+        steps = group_steps_to_max(split_rationale_into_sentences(rationale), self.max_latent_stage)
         solution = f"{rationale}\n<answer>{answer}</answer>" if rationale else f"<answer>{answer}</answer>"
         return {
             "id": row.get("id", index),
             "image": row["image"],
-            "question": "\n".join(question_parts),
+            "question": formatted_question,
+            "steps": steps,
+            "answer": answer,
             "solution": solution,
             "gold_answer": normalize_answer_text(answer),
-            "choices": choices,
             "domain": row.get("domain"),
             "topic": row.get("topic"),
+            "idx": int(index),
         }
 
 
@@ -232,6 +236,8 @@ def build_dataset(dataset_cfg: Dict[str, Any], limit: Optional[int] = None, part
             split=split,
             limit=dataset_limit,
             dataset_name=dataset_cfg.get("name", "LightChen2333/M3CoT"),
+            require_image=bool(dataset_cfg.get("require_image", True)),
+            max_latent_stage=int(dataset_cfg.get("max_latent_stage", 8)),
         )
     if dataset_type in {"scienceqa", "science-qa"}:
         split = partition if partition in {"train", "validation", "test"} else dataset_cfg.get("split", "train")

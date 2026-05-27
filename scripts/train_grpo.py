@@ -90,6 +90,23 @@ def save_controller_checkpoint(model: torch.nn.Module, checkpoint_path: Path) ->
     print(f"Saved controller checkpoint to {checkpoint_path}")
 
 
+def compute_grpo_policy_loss(advantages: torch.Tensor, rollout_outputs: list) -> torch.Tensor | None:
+    """Build the policy-gradient loss from rollout action log-prob tensors."""
+    loss_terms = []
+    for advantage, rollout in zip(advantages, rollout_outputs):
+        action_log_prob_sum = rollout.get("action_log_prob_sum")
+
+        if action_log_prob_sum is None:
+            continue
+
+        action_loss = action_log_prob_sum / max(1, len(rollout["action_log_probs"]))
+        loss_terms.append(-advantage.detach() * action_loss)
+
+    if not loss_terms:
+        return None
+    return torch.stack(loss_terms).mean()
+
+
 def main() -> None:
     """Train controller-facing LVAR parameters using custom grouped rollouts."""
     parser = argparse.ArgumentParser(description="Train the LVAR controller with custom GRPO-style updates.")
@@ -211,25 +228,13 @@ def main() -> None:
             # ------------------------------------------------------------
             # 4. Policy-gradient objective over sampled action log-probs.
             # ------------------------------------------------------------
-            loss_terms = []
-            for advantage, rollout in zip(advantages, rollout_outputs):
-                action_log_prob_sum = rollout.get("action_log_prob_sum")
-                
-                if action_log_prob_sum is None:
-                    continue
-                
-                action_loss = action_log_prob_sum / max(1, len(rollout["action_log_probs"]))
-
-                # action_log_prob_sum must be a differentiable tensor
-                # produced by the controller during sampled rollout.
-                loss_terms.append(
-                    -advantage.detach() * action_loss
-                )
-
-            if not loss_terms:
+            # action_log_prob_sum must be a differentiable tensor produced by
+            # the controller during sampled rollout.
+            loss = compute_grpo_policy_loss(advantages, rollout_outputs)
+            if loss is None:
                 continue
 
-            loss = torch.stack(loss_terms).mean()
+            loss_value = float(loss.detach().item())
 
             optimizer.zero_grad(set_to_none=True)
             accelerator.backward(loss)
@@ -241,12 +246,16 @@ def main() -> None:
 
             optimizer.step()
 
+            del rollout_outputs, loss
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
             global_step += 1
 
             if global_step % log_every == 0 and accelerator.is_local_main_process:
                 print(
                     f"epoch={epoch} step={global_step} "
-                    f"loss={float(loss.item()):.4f} "
+                    f"loss={loss_value:.4f} "
                     f"reward_mean={float(reward_tensor.mean().item()):.4f} "
                     f"reward_std={float(reward_tensor.std(unbiased=False).item()):.4f} "
                     f"baseline_score={baseline_score_float:.1f} "

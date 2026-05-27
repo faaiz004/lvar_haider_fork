@@ -3,6 +3,7 @@ import random
 import sys
 from pathlib import Path
 
+import torch
 import yaml
 
 # Allow running as a script: `python scripts/debug_single.py ...`.
@@ -26,8 +27,13 @@ def main() -> None:
     """Run one example and print a human-readable LVAR reasoning trace."""
     # CLI inputs: config path plus optional explicit example index override.
     parser = argparse.ArgumentParser(description="Run a single LVAR debug example.")
-    parser.add_argument("--config", default="configs/qwen2vl_clevr.yaml")
+    parser.add_argument("--config", default="configs/qwen2vl_m3cot.yaml")
     parser.add_argument("--index", type=int, default=None)
+    parser.add_argument(
+        "--rollout",
+        action="store_true",
+        help="If set, run 6 stochastic LVAR rollouts for the same question.",
+    )
     add_model_loading_args(parser)
     args = parser.parse_args()
 
@@ -41,8 +47,24 @@ def main() -> None:
     example = dataset[index]
 
     model = QwenLVAR(config["model"])
-    uses_sampling = model._inference_uses_sampling()
-    lvar_output = model.generate_lvar(example["image"], example["question"])
+    uses_sampling = model._inference_uses_sampling() if not args.rollout else True
+    lvar_output = None
+    rollout_outputs = []
+    if args.rollout:
+        was_training = model.training
+        model.eval()
+        with torch.no_grad():
+            for _ in range(6):
+                rollout_outputs.append(
+                    model.forward(
+                        example["image"],
+                        example["question"],
+                        sample_actions=True,
+                    )
+                )
+        model.train(was_training)
+    else:
+        lvar_output = model.generate_lvar(example["image"], example["question"])
     # baseline_output = model.generate_baseline(example["image"], example["question"])
 
     # Print structured trace for quick inspection of action choices and loop length.
@@ -54,11 +76,22 @@ def main() -> None:
     )
     print(f"Question: {example['question']}")
     print(f"Gold answer: {example['gold_answer']}")
-    print("Reasoning trace:")
-    for step in lvar_output["trace"]:
-        print(f"  {format_trace_step(step)}")
-    print(f"LVAR answer: {lvar_output['prediction']}")
-    print(f"Generated token IDs: {lvar_output['generated_ids']}")
+    if args.rollout:
+        for rollout_idx, rollout in enumerate(rollout_outputs, start=1):
+            print(f"Rollout {rollout_idx}/6:")
+            print("Reasoning trace:")
+            for step in rollout["trace"]:
+                print(f"  {format_trace_step(step)}")
+            print(f"LVAR answer: {rollout['answer']}")
+            print(f"Generated token IDs: {rollout['generated_ids']}")
+            print(f"Num steps: {rollout['num_steps']}")
+            print(f"Stopped: {rollout['stopped']}")
+    else:
+        print("Reasoning trace:")
+        for step in lvar_output["trace"]:
+            print(f"  {format_trace_step(step)}")
+        print(f"LVAR answer: {lvar_output['prediction']}")
+        print(f"Generated token IDs: {lvar_output['generated_ids']}")
     # print(f"Baseline answer: {baseline_output['prediction']}")
     # print(f"Reasoning steps: {lvar_output['num_steps']}")
 
