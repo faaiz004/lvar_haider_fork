@@ -33,6 +33,7 @@ def set_seed(seed: int) -> None:
 
 def write_jsonl_row(handle, row) -> None:
     handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+    handle.flush()
 
 
 def write_json(path: Path, data) -> None:
@@ -49,12 +50,53 @@ def collect_example_ids(dataset) -> list:
     return ids
 
 
+def read_completed_example_ids(path: Path) -> set:
+    """Read existing JSONL output and return mined example ids."""
+    if not path.exists():
+        return set()
+    completed = set()
+    with open(path, "r", encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, start=1):
+            stripped = line.strip()
+            if not stripped:
+                continue
+            try:
+                row = json.loads(stripped)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"Invalid JSON in {path} at line {line_number}: {exc}") from exc
+            example_id = row.get("example_id")
+            if example_id is not None:
+                completed.add(example_id)
+    return completed
+
+
+def iter_dataset_indices(dataset_length: int, start_from_end: bool = False) -> list:
+    """Return dataset indices in forward or reverse mining order."""
+    if start_from_end:
+        return list(range(dataset_length - 1, -1, -1))
+    return list(range(dataset_length))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Mine Phase 2 oracle traces from M3CoT.")
     parser.add_argument("--config", default="configs/qwen2vl_m3cot.yaml")
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--output", default=None)
     parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument(
+        "--start-from-end",
+        "--reverse",
+        dest="start_from_end",
+        action="store_true",
+        help="Mine examples from the end of the dataset toward the beginning.",
+    )
+    parser.add_argument(
+        "--resume",
+        dest="resume",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Read the existing output JSONL and skip already mined example ids. Enabled by default.",
+    )
     add_model_loading_args(parser)
     args = parser.parse_args()
 
@@ -70,6 +112,9 @@ def main() -> None:
     dataset = build_dataset(dataset_cfg, limit=limit, partition=phase2_cfg.get("dataset_partition"))
     output_path = Path(args.output or phase2_cfg.get("output_path", "outputs/phase2_m3cot_traces.jsonl"))
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    resume = bool(phase2_cfg.get("resume", True)) if args.resume is None else bool(args.resume)
+    start_from_end = bool(args.start_from_end or phase2_cfg.get("start_from_end", False))
+    completed_ids = read_completed_example_ids(output_path) if resume else set()
 
     model = QwenLVAR(config["model"])
     model.eval()
@@ -81,11 +126,24 @@ def main() -> None:
         rng=random.Random(seed),
         initial_visual_mode=str(phase2_cfg.get("initial_visual_mode", "global_mean")),
         image_size=phase2_cfg.get("image_size", 280),
+        counterfactual_negative_source=str(phase2_cfg.get("counterfactual_negative_source", "same_image")),
     )
 
     example_ids = collect_example_ids(dataset)
-    with open(output_path, "w", encoding="utf-8") as handle:
-        for example in tqdm(dataset, total=len(dataset), desc="Mining Phase 2"):
+    indices = iter_dataset_indices(len(dataset), start_from_end=start_from_end)
+    pending_indices = []
+    skipped_existing = 0
+    for index in indices:
+        example = dataset[index]
+        if example.get("id", index) in completed_ids:
+            skipped_existing += 1
+            continue
+        pending_indices.append(index)
+
+    file_mode = "a" if resume else "w"
+    with open(output_path, file_mode, encoding="utf-8") as handle:
+        for index in tqdm(pending_indices, total=len(pending_indices), desc="Mining Phase 2"):
+            example = dataset[index]
             row = miner.mine_example(example, negative_global_example_ids=example_ids)
             write_jsonl_row(handle, row)
 
@@ -96,6 +154,10 @@ def main() -> None:
             "dataset_type": dataset_cfg.get("type"),
             "dataset_name": dataset_cfg.get("name"),
             "num_examples": len(dataset),
+            "num_mined_this_run": len(pending_indices),
+            "num_skipped_existing": skipped_existing,
+            "resume": resume,
+            "start_from_end": start_from_end,
             "seed": seed,
         }
     )

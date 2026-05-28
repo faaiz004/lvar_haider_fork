@@ -4,13 +4,15 @@ model:
   dtype: auto
   max_steps: 8
   region_window: 2
-  max_answer_tokens: 16
+  max_answer_tokens: 32
   action_selection: sample
   controller_temperature: 3.0
   pooling: mean
   use_control_tokens: false
   think_append_hidden: true
   controller_context_window: 3
+  use_checkpoint: true
+  checkpoint_path: "/home/csalt/Haider/DVLM/IVT-LR/qwen_vl/outputs_dynamic_ivtlr/qwen_IVTLR_m3cot_no_hidden_distill_8_steps_prefix_span/epoch_20_full_model_fp32.pth"
 
 dataset:
   type: m3cot
@@ -26,6 +28,8 @@ phase2:
   patch_k_choices: [1, 2, 3, 4]
   max_steps: 8
   image_size: 280
+  resume: true
+  start_from_end: false
   output_path: outputs/phase2_m3cot_traces.jsonl
   initial_visual_mode: global_mean
 

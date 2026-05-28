@@ -91,6 +91,7 @@ class OracleTraceMiner:
         rng: Optional[random.Random] = None,
         initial_visual_mode: str = "global_mean",
         image_size: Optional[int] = 280,
+        counterfactual_negative_source: str = "same_image",
     ) -> None:
         self.model = model
         self.selection_delta = float(selection_delta)
@@ -99,6 +100,10 @@ class OracleTraceMiner:
         self.rng = rng or random.Random()
         self.initial_visual_mode = initial_visual_mode
         self.image_size = image_size
+        negative_source = str(counterfactual_negative_source).strip().lower()
+        if negative_source not in {"same_image", "different_image"}:
+            raise ValueError("counterfactual_negative_source must be 'same_image' or 'different_image'.")
+        self.counterfactual_negative_source = negative_source
         self.summary = {
             "num_examples": 0,
             "num_decisions": 0,
@@ -292,11 +297,23 @@ class OracleTraceMiner:
         }
         patch_pool = [idx for idx in range(int(bank["patches"].size(0))) if idx not in positive_patch_indices]
         used_negative_patches = set()
-        global_pool = [candidate_id for candidate_id in (negative_global_example_ids or []) if candidate_id != example_id]
+        cross_image_pool = [candidate_id for candidate_id in (negative_global_example_ids or []) if candidate_id != example_id]
 
         for action in positive_actions:
             action_type = action.get("type")
             if action_type == "PATCH":
+                if self.counterfactual_negative_source == "different_image":
+                    if not cross_image_pool:
+                        self._record_counterfactual_skip("patch_no_negative_example")
+                        return None
+                    negative_actions.append(
+                        {
+                            "type": "PATCH",
+                            "patch_idx": int(action["patch_idx"]),
+                            "source_example_id": self.rng.choice(list(cross_image_pool)),
+                        }
+                    )
+                    continue
                 available = [idx for idx in patch_pool if idx not in used_negative_patches]
                 if not available:
                     available = patch_pool
@@ -307,16 +324,28 @@ class OracleTraceMiner:
                 used_negative_patches.add(wrong_idx)
                 negative_actions.append({"type": "PATCH", "patch_idx": wrong_idx})
             elif action_type == "REGION":
+                if self.counterfactual_negative_source == "different_image":
+                    if not cross_image_pool:
+                        self._record_counterfactual_skip("region_no_negative_example")
+                        return None
+                    negative_actions.append(
+                        {
+                            "type": "REGION",
+                            "region_idx": int(action["region_idx"]),
+                            "source_example_id": self.rng.choice(list(cross_image_pool)),
+                        }
+                    )
+                    continue
                 pool = [idx for idx in range(int(bank["raw_regions"].size(0))) if idx != int(action["region_idx"])]
                 if not pool:
                     self._record_counterfactual_skip("region_no_negative")
                     return None
                 negative_actions.append({"type": "REGION", "region_idx": int(self.rng.choice(pool))})
             elif action_type == "GLOBAL":
-                if not global_pool:
+                if not cross_image_pool:
                     self._record_counterfactual_skip("global_no_negative_example")
                     return None
-                negative_actions.append({"type": "GLOBAL", "source_example_id": self.rng.choice(list(global_pool))})
+                negative_actions.append({"type": "GLOBAL", "source_example_id": self.rng.choice(list(cross_image_pool))})
             else:
                 negative_actions.append(copy.deepcopy(action))
 
@@ -417,7 +446,9 @@ class OracleTraceMiner:
         }
 
     def get_summary(self) -> Dict[str, Any]:
-        return copy.deepcopy(self.summary)
+        summary = copy.deepcopy(self.summary)
+        summary["counterfactual_negative_source"] = self.counterfactual_negative_source
+        return summary
 
 
 def action_type_counts(rows: Iterable[Dict[str, Any]]) -> Dict[str, int]:

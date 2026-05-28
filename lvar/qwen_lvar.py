@@ -867,6 +867,19 @@ class QwenLVAR(nn.Module):
                 cloned[key] = value
         return cloned
 
+    def _extract_final_hidden(self, outputs: Any) -> torch.Tensor:
+        """Read the final sequence hidden state from HF causal/output variants."""
+        hidden_states = getattr(outputs, "hidden_states", None)
+        if hidden_states is not None:
+            return hidden_states[-1]
+        last_hidden = getattr(outputs, "last_hidden_state", None)
+        if last_hidden is not None:
+            return last_hidden
+        raise AttributeError(
+            "Backbone output did not include hidden_states or last_hidden_state; "
+            "call the backbone with output_hidden_states=True when hidden tokens are needed."
+        )
+
     def _read_current_hidden(self, state: Dict[str, Any]) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         """Run the frozen backbone and return hidden states needed for explicit THINK."""
         with torch.no_grad():
@@ -877,11 +890,7 @@ class QwenLVAR(nn.Module):
                 return_dict=True,
                 use_cache=False,
             )
-        hidden_states = getattr(outputs, "hidden_states", None)
-        if hidden_states is not None:
-            final_hidden = hidden_states[-1]
-        else:
-            final_hidden = getattr(outputs, "last_hidden_state")
+        final_hidden = self._extract_final_hidden(outputs)
         last_hidden = final_hidden[:, -1, :]
         if self.use_control_tokens:
             state_hidden = final_hidden[:, state["latent_pos"], :]
@@ -946,11 +955,11 @@ class QwenLVAR(nn.Module):
             outputs = self.backbone(
                 inputs_embeds=state["inputs_embeds"],
                 attention_mask=state["attention_mask"],
-                output_hidden_states=False,
+                output_hidden_states=True,
                 return_dict=True,
                 use_cache=False,
             )
-        final_hidden = outputs.hidden_states[-1] if (hasattr(outputs, "hidden_states") and outputs.hidden_states is not None) else outputs.last_hidden_state
+        final_hidden = self._extract_final_hidden(outputs)
         last_hidden = final_hidden[:, -1, :]
         if self.use_control_tokens:
             state_hidden = final_hidden[:, state["latent_pos"], :]

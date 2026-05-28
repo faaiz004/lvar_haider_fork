@@ -358,6 +358,50 @@ class QwenLVARTests(unittest.TestCase):
         self.assertIsNone(capture["act_hidden"])
         self.assertEqual(tuple(capture["step_hidden"].shape), (1, 4))
 
+    def test_reasoning_step_supports_causal_outputs_without_last_hidden_state(self):
+        model = build_model()
+        calls = []
+
+        def forward(
+            input_ids=None,
+            inputs_embeds=None,
+            attention_mask=None,
+            output_hidden_states=False,
+            return_dict=True,
+            use_cache=False,
+            **kwargs,
+        ):
+            del input_ids, attention_mask, return_dict, use_cache, kwargs
+            calls.append(output_hidden_states)
+            seq_len = inputs_embeds.size(1)
+            positions = torch.arange(seq_len, device=inputs_embeds.device, dtype=inputs_embeds.dtype).view(1, seq_len, 1)
+            hidden = inputs_embeds + positions * 0.01
+            logits = torch.zeros((1, seq_len, 4), device=inputs_embeds.device, dtype=inputs_embeds.dtype)
+            return types.SimpleNamespace(logits=logits, hidden_states=[inputs_embeds, hidden])
+
+        model.backbone.forward = forward
+        prepared = model.prepare_inputs("image", "question")
+        projected = model.get_projected_image_tokens(prepared)
+        prepared["projected_image_tokens"] = projected
+        bank = model.build_visual_bank(projected)
+        state = model.build_initial_state(prepared)
+        capture = {}
+
+        def controller_forward(state_hidden, step_hidden, bank, act_hidden=None):
+            capture["state_hidden"] = state_hidden.detach().clone()
+            type_logits = torch.full((1, 5), -10.0)
+            type_logits[0, ACTION_STOP] = 10.0
+            region_logits = torch.zeros(1, bank["regions"].size(0))
+            patch_logits = torch.zeros(1, bank["patches"].size(0))
+            return type_logits, region_logits, patch_logits
+
+        model.controller.forward = controller_forward
+        model.forward_reasoning_step(state, bank, 0)
+
+        self.assertEqual(calls, [True])
+        expected = state["inputs_embeds"][:, -1, :] + 0.05
+        self.assertTrue(torch.allclose(capture["state_hidden"], expected))
+
     def test_forward_reasoning_actions_tokenless(self):
         for action_id in [ACTION_THINK, ACTION_STOP, ACTION_GLOBAL, ACTION_REGION, ACTION_PATCH]:
             with self.subTest(action_id=action_id):

@@ -23,6 +23,36 @@ def load_config(config_path: str):
         return yaml.safe_load(handle)
 
 
+def resize_image(image, image_size: int):
+    """Resize PIL-like images to the fixed debug/mining resolution."""
+    if image is not None and hasattr(image, "resize"):
+        return image.resize((int(image_size), int(image_size)))
+    return image
+
+
+def print_visual_token_stats(model: QwenLVAR, image, question: str, image_size: int) -> None:
+    """Print visual-bank sizes before running the answer generation path."""
+    with torch.no_grad():
+        prepared = model.prepare_inputs(
+            image,
+            question,
+            image_size=image_size,
+        )
+        image_tokens = model.get_projected_image_tokens(prepared)
+        bank = model.build_visual_bank(image_tokens)
+
+    patch_tokens = image_tokens.squeeze(0) if image_tokens.dim() == 3 else image_tokens
+    regions = bank["regions"]
+    global_tokens = bank["global"]
+
+    print(f"Image size: {image_size}x{image_size}")
+    print(f"Image tokens: {patch_tokens.size(0)} tokens, dim {patch_tokens.size(-1)}")
+    print(f"Regions: {regions.size(0)} regions, dim {regions.size(-1)}")
+    print(f"Global tokens: {global_tokens.size(0)} tokens, dim {global_tokens.size(-1)}")
+    if model._current_postmerge_grid is not None:
+        print(f"Post-merge image grid: {model._current_postmerge_grid}")
+
+
 def main() -> None:
     """Run one example and print a human-readable LVAR reasoning trace."""
     # CLI inputs: config path plus optional explicit example index override.
@@ -47,6 +77,10 @@ def main() -> None:
     example = dataset[index]
 
     model = QwenLVAR(config["model"])
+    image_size = int(config.get("debug", {}).get("image_size", config.get("phase2", {}).get("image_size", 280)))
+    image = resize_image(example["image"], image_size)
+    print_visual_token_stats(model, image, example["question"], image_size)
+
     uses_sampling = model._inference_uses_sampling() if not args.rollout else True
     lvar_output = None
     rollout_outputs = []
@@ -57,14 +91,14 @@ def main() -> None:
             for _ in range(6):
                 rollout_outputs.append(
                     model.forward(
-                        example["image"],
+                        image,
                         example["question"],
                         sample_actions=True,
                     )
                 )
         model.train(was_training)
     else:
-        lvar_output = model.generate_lvar(example["image"], example["question"])
+        lvar_output = model.generate_lvar(image, example["question"])
     # baseline_output = model.generate_baseline(example["image"], example["question"])
 
     # Print structured trace for quick inspection of action choices and loop length.
